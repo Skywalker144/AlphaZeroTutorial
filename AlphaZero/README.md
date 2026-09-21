@@ -1,18 +1,65 @@
 # AlphaZero
 
-状态：路线规划，尚未实现。
+用 Python、NumPy 和 PyTorch 实现策略价值网络、MCTS、自我对弈与训练，支持井字棋和自由规则五子棋，无需编译 C++。
 
-目标是用 Python 建立可读的自我对弈学习闭环，为 KataGo 和 MuZero 路线提供算法基础。
+当前提供可运行的训练与命令行对弈代码，不附带预训练模型；系统化教程和固定对手评估尚待完善。
 
-## 拟定学习顺序
+## 环境与入口
 
-1. 游戏环境：状态、动作、合法性、终局，以及当前玩家视角。
-2. 策略与价值网络：输入编码、策略分布与局面价值。
-3. MCTS：PUCT 选择、扩展、价值回传和访问次数分布。
-4. 自我对弈：根节点探索、落子温度、策略目标和终局价值目标。
-5. 训练：基础回放缓冲区、策略与价值损失、模型保存与恢复。
-6. 评估：固定对手、先后手分配、搜索预算和结果统计。
+使用 Python 3.10 或更高版本。从仓库根目录进入 `AlphaZero/` 后执行安装、训练、对弈和测试命令：
 
-基础教程优先保留清晰的算法流程，动态回放窗口、自适应采样调度等技巧单独解释和验证。
+```bash
+cd AlphaZero
+python -m pip install -r requirements.txt
 
-原始算法参考：[AlphaZero 论文](https://arxiv.org/abs/1712.01815)。教学简化及与论文的差异将在对应实现中说明。
+# 井字棋
+python -m tictactoe.train
+python -m tictactoe.play
+
+# 五子棋
+python -m gomoku.train
+python -m gomoku.play
+
+# 测试
+python -m pip install pytest
+python -m pytest tests/ -q
+```
+
+本机使用 Conda 环境时先执行 `conda activate pytorch`；非交互命令也可使用 `conda run -n pytorch python ...`。
+
+设备选择见 [auto_device](alphazero/utils.py)：优先 CUDA，其次 MPS，最后 CPU。训练配置中的 `device` 可显式指定设备。
+
+## 代码阅读顺序
+
+| 模块 | 内容 |
+| --- | --- |
+| [井字棋环境](envs/tictactoe.py)、[五子棋环境](envs/gomoku.py) | 状态、合法动作、落子、胜负与网络输入编码 |
+| [network.py](alphazero/network.py) | ResNet 主干、策略 logits 和价值输出 |
+| [mcts.py](alphazero/mcts.py) | PUCT 选择、扩展、视角转换与价值回传 |
+| [replay_buffer.py](alphazero/replay_buffer.py) | 动态回放窗口、样本保留与随机采样 |
+| [trainer.py](alphazero/trainer.py) | 自我对弈、训练调度、损失、checkpoint 与绘图 |
+| [utils.py](alphazero/utils.py) | 根节点噪声、棋盘对称增强、设备选择与棋盘显示 |
+| [tests/](tests/) | 游戏规则、搜索、训练和恢复测试 |
+
+两个游戏均为交替行动的双人零和棋盘游戏。五子棋默认使用 9×9 棋盘，连续五子及以上获胜，不包含禁手。环境接口和动作编码以对应实现为准。
+
+## 配置与训练产物
+
+训练配置分别位于 [tictactoe/train.py](tictactoe/train.py) 和 [gomoku/train.py](gomoku/train.py) 的 `train_args` 中；当前没有单独的 `config.py` 或命令行参数解析。
+
+- 默认持续训练，`Ctrl+C` 会保存 `checkpoint_final.pth` 和曲线后退出。有限轮数运行可在 `train_args` 中设置 `num_iterations`；需要结束时保存则将 `save_interval` 设为合适的间隔。
+- 训练开始时自动读取当前游戏输出目录内修改时间最新的 checkpoint。开启独立实验时使用不同的 `data_dir`。
+- 模型、优化器、回放数据及部分训练统计保存在 `data/<game>/checkpoints/`，损失和自我对弈统计图保存在 `data/<game>/logs/`。这些产物不纳入 Git。
+- 对弈入口会询问 checkpoint 路径；回车选择最新文件，没有文件时使用随机权重。落子输入为从零开始的行、列坐标。
+
+默认配置面向持续训练。仅检查流程时，应使用较小网络、较少搜索次数、较低的 `min_rows`、较小批次和有限的训练轮数；同时确保回放缓冲区能提供完整批次。
+
+## 当前行为与边界
+
+- 自我对弈逐局执行，搜索逐节点推理；没有并行自我对弈或批量搜索推理。
+- 自我对弈按搜索访问次数分布采样落子，没有随对局进度变化的温度调度；对弈入口按最大访问次数选择动作，但目前沿用训练配置中的根节点噪声。
+- 回放窗口随累计数据量增长，采样局数按目标回放比调度，属于基础 AlphaZero 流程之外的训练策略。
+- checkpoint 尚未保存完整配置、随机数状态和全局迭代编号；恢复训练后迭代编号从 1 开始，保存时可能覆盖同名编号文件，因此不保证逐步精确复现。
+- 自我对弈中的黑白胜率与训练损失用于观察流程，不代表相对于固定对手的棋力；当前没有自动化棋力评估入口。
+
+原始算法参考：[AlphaZero 论文](https://arxiv.org/abs/1712.01815)。当前实现的配置、训练策略和运行规模不等同于论文实验。
