@@ -3,7 +3,12 @@ import math
 import numpy as np
 import torch
 
-from .utils import add_dirichlet_noise, softmax
+from .utils import (
+    add_dirichlet_noise,
+    apply_temperature,
+    root_policy_temperature,
+    softmax,
+)
 
 
 class Node:
@@ -80,7 +85,7 @@ class MCTS:
             node = node.parent
 
     @torch.inference_mode()
-    def search(self, state, to_play, num_simulations):
+    def search(self, state, to_play, num_simulations, turn_number, cheap):
 
         policy, value = self.nn_inference(state, to_play)
         
@@ -89,7 +94,11 @@ class MCTS:
 
         root = Node(state, to_play)
 
-        if self.args.get("mode", "train") == "train":
+        if self.args.get("mode", "train") == "train" and not cheap:
+            policy = apply_temperature(
+                policy,
+                root_policy_temperature(self.args, turn_number, self.game.board_size),
+            )
             policy = add_dirichlet_noise(
                 policy,
                 self.args.get("dirichlet_total_concentration", 0.03 * self.game.board_size ** 2),

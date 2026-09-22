@@ -18,6 +18,7 @@ def tiny_args(tmp_path):
         "num_channels": 8,
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
         "dirichlet_noise_weight": 0.25,
+        "cheap_search_prob": 0.0,
         "num_iterations": 2,
         "train_steps": 2,
         "batch_size": 16,
@@ -57,6 +58,21 @@ class TestSelfplay:
         assert not az.model.training
         after = [p.detach() for p in az.model.parameters()]
         assert all(torch.equal(a, b) for a, b in zip(before, after))
+
+
+class TestPlayoutCapRandomization:
+    def test_all_full_records_every_move(self, tiny_args):
+        args = {**tiny_args, "cheap_search_prob": 0.0}
+        az = AlphaZero(TicTacToe(), args)
+        samples, winner, game_len = az.selfplay()
+        assert len(samples) == game_len > 0
+
+    def test_all_cheap_records_nothing(self, tiny_args):
+        args = {**tiny_args, "cheap_search_prob": 1.0}
+        az = AlphaZero(TicTacToe(), args)
+        samples, winner, game_len = az.selfplay()
+        assert samples == []
+        assert game_len > 0
 
 
 class TestValueTargets:

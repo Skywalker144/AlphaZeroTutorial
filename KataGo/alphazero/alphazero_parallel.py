@@ -4,7 +4,12 @@ import math
 import numpy as np
 import torch
 
-from .utils import add_dirichlet_noise
+from .utils import (
+    add_dirichlet_noise,
+    apply_temperature,
+    chosen_move_temperature,
+    root_policy_temperature,
+)
 
 
 class _Node:
@@ -158,7 +163,10 @@ class _GameSession:
         "action_size",
         "c_puct",
         "num_simulations",
-        "half_life",
+        "cheap_search_prob",
+        "cheap_search_visits",
+        "is_cheap",
+        "turn_number",
         "dirichlet_concentration",
         "dirichlet_noise_weight",
         "state",
@@ -174,10 +182,16 @@ class _GameSession:
         # 每局固定不变的超参数在构造时解析一次，避免每次模拟都查 args。
         self.action_size = game.board_size ** 2
         self.c_puct = args.get("c_puct", 1.5)
-        self.num_simulations = int(
+        self.num_simulations = round(
             args.get("num_simulations", 1.7 * game.board_size ** 2)
         )
-        self.half_life = args.get("half_life", game.board_size)
+        self.cheap_search_prob = args.get("cheap_search_prob", 0.75)
+        self.cheap_search_visits = min(
+            self.num_simulations,
+            round(args.get("cheap_search_visits", 0.3 * game.board_size ** 2)),
+        )
+        self.is_cheap = False
+        self.turn_number = 0
         self.dirichlet_concentration = args.get(
             "dirichlet_total_concentration", 0.03 * game.board_size ** 2
         )
@@ -192,7 +206,11 @@ class _GameSession:
     # -- 搜索生命周期 -----------------------------------------------------
 
     def _start_search(self):
-        search = _Search(self.state, self.to_play, self.num_simulations)
+        self.is_cheap = np.random.random() < self.cheap_search_prob
+        num_simulations = (
+            self.cheap_search_visits if self.is_cheap else self.num_simulations
+        )
+        search = _Search(self.state, self.to_play, num_simulations)
         search.pending = search.root  # 根节点评估最先入队
         self.search = search
         return search.root
@@ -206,22 +224,26 @@ class _GameSession:
             mcts_policy[child.action_taken] = child.visits
         mcts_policy /= np.sum(mcts_policy)
 
-        self.memory.append({
-            "state": self.state,
-            "to_play": self.to_play,
-            "mcts_policy": mcts_policy,
-        })
+        if not self.is_cheap:
+            self.memory.append({
+                "state": self.state,
+                "to_play": self.to_play,
+                "mcts_policy": mcts_policy,
+            })
 
-        if len(self.memory) < self.half_life:
-            action = np.random.choice(self.action_size, p=mcts_policy)
-        else:
-            action = int(np.argmax(mcts_policy))
+        temperature = chosen_move_temperature(
+            self.args, self.turn_number, self.game.board_size
+        )
+        action = np.random.choice(
+            self.action_size, p=apply_temperature(mcts_policy, temperature)
+        )
 
         # 本步的搜索树已用完（样本已记录、策略已取出），主动断环立即释放。
         _discard_tree(search.root)
 
         self.state = game.get_next_state(self.state, action, self.to_play)
         self.to_play = -self.to_play
+        self.turn_number += 1
         self.search = None
 
         if game.is_terminal(self.state, self.to_play):
@@ -236,7 +258,7 @@ class _GameSession:
                 }
                 for sample in memory
             ]
-            self.result = (samples, winner, len(memory))
+            self.result = (samples, winner, self.turn_number)
 
     # -- 状态机入口 -------------------------------------------------------
 
@@ -291,7 +313,15 @@ class _GameSession:
             legal_actions_mask = game.get_legal_action_mask(
                 _materialize(node, game), node.to_play
             )
-        if node is search.root and self.args.get("mode", "train") == "train":
+        if (
+            node is search.root
+            and self.args.get("mode", "train") == "train"
+            and not self.is_cheap
+        ):
+            policy = apply_temperature(
+                policy,
+                root_policy_temperature(self.args, self.turn_number, self.game.board_size),
+            )
             policy = add_dirichlet_noise(
                 policy,
                 self.dirichlet_concentration,
@@ -325,8 +355,8 @@ class ParallelSelfPlayer:
         设为 False 退回串行 selfplay（见 trainer.AlphaZero）。
     num_parallel_games
         同时保持活跃的对局数，也约等于每轮批量推理的 batch 大小。默认 32。
-    其余搜索相关参数（num_simulations / c_puct / half_life /
-    dirichlet_total_concentration）含义与串行版完全相同。
+    其余搜索相关参数（num_simulations / c_puct / 根温度 /
+    落子温度 / dirichlet_total_concentration）含义与串行版完全相同。
     """
 
     def __init__(self, game, args, model, device):

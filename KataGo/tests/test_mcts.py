@@ -4,7 +4,14 @@ import torch
 
 from alphazero import MCTS, ResNet, auto_device
 from alphazero.mcts import Node
-from alphazero.utils import add_dirichlet_noise, softmax
+from alphazero.utils import (
+    add_dirichlet_noise,
+    apply_temperature,
+    chosen_move_temperature,
+    interpolate_early,
+    root_policy_temperature,
+    softmax,
+)
 from envs.gomoku import Gomoku
 
 
@@ -78,6 +85,71 @@ class TestDirichlet:
         assert np.isclose(noisy.sum(), 1.0)
 
 
+class TestTemperature:
+    def test_interpolate_early_endpoints(self):
+        assert np.isclose(interpolate_early(0, 19, 0.75, 0.15, 9), 0.75)
+        assert interpolate_early(10_000, 19, 0.75, 0.15, 9) < 0.15 + 1e-9
+
+    def test_interpolate_early_board_scaling(self):
+        assert np.isclose(interpolate_early(9, 19, 0.75, 0.15, 9), 0.45)
+        assert np.isclose(interpolate_early(19, 19, 0.75, 0.15, 19), 0.45)
+
+    def test_apply_temperature_identity(self):
+        probs = np.array([0.5, 0.25, 0.25])
+        assert np.allclose(apply_temperature(probs, 1.0), probs)
+
+    def test_apply_temperature_flattens_and_sharpens(self):
+        probs = np.array([0.5, 0.25, 0.25])
+        assert apply_temperature(probs, 2.0)[0] < probs[0]
+        assert apply_temperature(probs, 0.5)[0] > probs[0]
+
+    def test_apply_temperature_near_zero_is_argmax(self):
+        probs = np.array([0.5, 0.25, 0.25])
+        assert np.array_equal(apply_temperature(probs, 0.0), np.array([1.0, 0.0, 0.0]))
+
+    def test_apply_temperature_keeps_zeros(self):
+        probs = np.array([0.9, 0.1, 0.0])
+        assert apply_temperature(probs, 1.5)[2] == 0.0
+
+    def test_temperature_schedules_use_configured_values(self):
+        args = {
+            "chosen_move_temperature_halflife": 9,
+            "root_policy_temperature_early": 1.3,
+            "root_policy_temperature": 1.1,
+            "chosen_move_temperature_early": 0.75,
+            "chosen_move_temperature": 0.15,
+        }
+        assert np.isclose(root_policy_temperature(args, 0, 9), 1.3)
+        assert np.isclose(chosen_move_temperature(args, 0, 9), 0.75)
+
+
+class TestCheapSearch:
+    def test_cheap_search_skips_root_temperature_and_noise(self, monkeypatch):
+        import alphazero.mcts as mcts_module
+
+        calls = {"temperature": 0, "noise": 0}
+        original_temperature = mcts_module.apply_temperature
+        original_noise = mcts_module.add_dirichlet_noise
+
+        def spy_temperature(*args, **kwargs):
+            calls["temperature"] += 1
+            return original_temperature(*args, **kwargs)
+
+        def spy_noise(*args, **kwargs):
+            calls["noise"] += 1
+            return original_noise(*args, **kwargs)
+
+        monkeypatch.setattr(mcts_module, "apply_temperature", spy_temperature)
+        monkeypatch.setattr(mcts_module, "add_dirichlet_noise", spy_noise)
+
+        game, mcts = make_mcts()
+        state = game.get_initial_state()
+        mcts.search(state, 1, 5, 0, True)
+        assert calls == {"temperature": 0, "noise": 0}
+        mcts.search(state, 1, 5, 0, False)
+        assert calls == {"temperature": 1, "noise": 1}
+
+
 class TestMCTS:
     def test_expand_uses_legality_instead_of_probability(self):
         game, mcts = make_mcts()
@@ -94,14 +166,14 @@ class TestMCTS:
     def test_policy_sums_to_one(self):
         game, mcts = make_mcts()
         state = game.get_initial_state()
-        policy, _ = mcts.search(state, 1, 20)
+        policy, _ = mcts.search(state, 1, 20, 0, False)
         assert np.isclose(policy.sum(), 1.0)
 
     def test_policy_only_on_legal(self):
         game, mcts = make_mcts()
         state = game.get_initial_state()
         state[0, 0] = 1
-        policy, _ = mcts.search(state, -1, 20)
+        policy, _ = mcts.search(state, -1, 20, 1, False)
         assert policy[0] == 0.0
 
     def test_terminal_value_correct(self):
@@ -115,7 +187,7 @@ class TestMCTS:
         # Four in a row pinned against the left edge: (4, 4) is the only win.
         state = np.zeros((9, 9), dtype=np.int8)
         state[4, 0:4] = 1
-        policy, _ = mcts.search(state, 1, 120)
+        policy, _ = mcts.search(state, 1, 120, 4, False)
         assert np.argmax(policy) == 4 * 9 + 4
         assert policy[4 * 9 + 4] > 0.5
 
@@ -126,6 +198,6 @@ class TestMCTS:
         model.eval()
         args = {"c_puct": 1.5, "dirichlet_total_concentration": 0.03 * 9 ** 2, "dirichlet_noise_weight": 0.0}
         state = game.get_initial_state()
-        p1, _ = MCTS(game, args, model, "cpu").search(state, 1, 15)
-        p2, _ = MCTS(game, args, model, "cpu").search(state, 1, 15)
+        p1, _ = MCTS(game, args, model, "cpu").search(state, 1, 15, 0, False)
+        p2, _ = MCTS(game, args, model, "cpu").search(state, 1, 15, 0, False)
         assert np.array_equal(p1, p2)

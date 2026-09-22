@@ -54,6 +54,7 @@ def play(game, train_args, side_names):
 
     state = game.get_initial_state()
     to_play = 1
+    turn_number = 0
     print_board(state)
 
     while not game.is_terminal(state, to_play):
@@ -71,13 +72,14 @@ def play(game, train_args, side_names):
                     break
                 print("Illegal move.")
         else:
-            policy, root_value = mcts.search(state, to_play, num_simulations)
+            policy, root_value = mcts.search(state, to_play, num_simulations, turn_number, False)
             action = int(np.argmax(policy))
             row, col = divmod(action, game.board_size)
             print(f"AlphaZero plays: {row} {col}  root_value={root_value:+.3f}")
 
         state = game.get_next_state(state, action, to_play)
         to_play = -to_play
+        turn_number += 1
         print_board(state, policy)
 
     winner = game.get_winner(state, to_play)

@@ -21,6 +21,44 @@ def softmax(x):
     return exp_x / np.sum(exp_x)
 
 
+def interpolate_early(turn_number, halflife, early_value, late_value, board_size):
+    halflives = (turn_number / halflife) * (19.0 / board_size)
+    return late_value + (early_value - late_value) * 0.5 ** halflives
+
+
+def root_policy_temperature(args, turn_number, board_size):
+    return interpolate_early(
+        turn_number,
+        args.get("chosen_move_temperature_halflife", 19.0),
+        args.get("root_policy_temperature_early", 1.3),
+        args.get("root_policy_temperature", 1.1),
+        board_size,
+    )
+
+
+def chosen_move_temperature(args, turn_number, board_size):
+    return interpolate_early(
+        turn_number,
+        args.get("chosen_move_temperature_halflife", 19.0),
+        args.get("chosen_move_temperature_early", 0.75),
+        args.get("chosen_move_temperature", 0.15),
+        board_size,
+    )
+
+
+def apply_temperature(probs, temperature):
+    if temperature <= 1e-4:
+        result = np.zeros_like(probs)
+        result[np.argmax(probs)] = 1.0
+        return result
+    positive = probs > 0
+    scaled = np.full(probs.shape, -np.inf)
+    scaled[positive] = np.log(probs[positive]) / temperature
+    scaled -= np.max(scaled)
+    result = np.exp(scaled)
+    return result / np.sum(result)
+
+
 def add_dirichlet_noise(policy, total_concentration, legal_actions_mask, noise_weight=0.25):
     """
     训练时 在根节点策略中混入 Dirichlet Noise 以鼓励探索：

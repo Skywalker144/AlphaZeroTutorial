@@ -15,6 +15,7 @@ def make_args(**overrides):
         "num_blocks": 1,
         "num_channels": 8,
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
+        "cheap_search_prob": 0.0,
         "num_parallel_games": 4,
     }
     args.update(overrides)
@@ -162,6 +163,7 @@ class TestTrainerIntegration:
             "num_blocks": 1,
             "num_channels": 8,
             "dirichlet_total_concentration": 0.03 * 3 ** 2,
+            "cheap_search_prob": 0.0,
             "parallel": True,
             "num_parallel_games": 3,
             "num_iterations": 1,

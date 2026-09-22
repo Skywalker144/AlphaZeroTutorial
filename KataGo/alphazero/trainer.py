@@ -13,7 +13,12 @@ from .metrics import MetricsTracker
 from .network import ResNet
 from .replay_buffer import ReplayBuffer
 from .scheduler import SelfPlayScheduler
-from .utils import auto_device, random_augment_batch
+from .utils import (
+    apply_temperature,
+    auto_device,
+    chosen_move_temperature,
+    random_augment_batch,
+)
 
 
 @dataclass
@@ -201,27 +206,42 @@ class AlphaZero:
         memory = []
         state = self.game.get_initial_state()
         to_play = 1
+        turn_number = 0
+        full_simulations = round(
+            self.args.get("num_simulations", 1.66 * self.game.board_size ** 2)
+        )
+        cheap_simulations = min(
+            full_simulations,
+            round(self.args.get("cheap_search_visits", 0.28 * self.game.board_size ** 2)),
+        )
+        cheap_search_prob = self.args.get("cheap_search_prob", 0.75)
         while not self.game.is_terminal(state, to_play):
 
+            cheap = np.random.random() < cheap_search_prob
             mcts_policy, _ = self.mcts.search(
                 state, to_play,
-                num_simulations=self.args.get("num_simulations", 1.7 * self.game.board_size ** 2)
+                num_simulations=cheap_simulations if cheap else full_simulations,
+                turn_number=turn_number,
+                cheap=cheap,
             )
 
-            memory.append({
-                "state": state,
-                "to_play": to_play,
-                "mcts_policy": mcts_policy,
-            })
+            if not cheap:
+                memory.append({
+                    "state": state,
+                    "to_play": to_play,
+                    "mcts_policy": mcts_policy,
+                })
 
-            half_life = self.args.get("half_life", self.game.board_size)
-            if len(memory) < half_life:
-                action = np.random.choice(len(mcts_policy), p=mcts_policy)
-            else:
-                action = int(np.argmax(mcts_policy))
+            temperature = chosen_move_temperature(
+                self.args, turn_number, self.game.board_size
+            )
+            action = np.random.choice(
+                len(mcts_policy), p=apply_temperature(mcts_policy, temperature)
+            )
 
             state = self.game.get_next_state(state, action, to_play)
             to_play = -to_play
+            turn_number += 1
 
         winner = self.game.get_winner(state, to_play)
         samples = [
@@ -232,7 +252,7 @@ class AlphaZero:
             }
             for sample in memory
         ]
-        return samples, winner, len(memory)
+        return samples, winner, turn_number
 
     def train_step(self):
         batch = self.replay_buffer.sample(self.args.get("batch_size", 128))
