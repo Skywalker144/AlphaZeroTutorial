@@ -1,50 +1,124 @@
+import gc
 import math
 
 import numpy as np
 import torch
 
-from .mcts import Node
-from .utils import add_dirichlet_noise, softmax
+from .utils import add_dirichlet_noise
+
+
+class _Node:
+    """与 ``mcts.Node`` 接口一致的轻量节点。
+
+    两处纯性能上的区别：
+
+    - 用 ``__slots__`` 去掉实例 ``__dict__``：MCTS 展开会产生海量节点，
+      构造与属性访问的开销非常可观。
+    - ``state`` 可以是 ``None``，表示惰性棋局状态：子节点刚展开时并不立刻
+      拷贝棋盘，等真正被访问（选择到 / 送去推理）时才由 ``_materialize``
+      从父节点算出来。终局判定、展开逻辑使用的状态值完全一致，且
+      ``get_next_state`` 是纯函数，因此搜索行为逐位不变。
+
+    树操作依赖的字段逐字段语义与 ``mcts.Node`` 完全相同。
+    """
+
+    __slots__ = (
+        "state",
+        "to_play",
+        "prior",
+        "parent",
+        "action_taken",
+        "children",
+        "value_sum",
+        "visits",
+        "legal_actions_mask",
+    )
+
+    def __init__(self, state, to_play, prior=0.0, parent=None, action_taken=None):
+        self.state = state
+        self.to_play = to_play
+        self.prior = prior
+        self.parent = parent
+        self.action_taken = action_taken
+        self.children = []
+        self.value_sum = 0.0
+        self.visits = 0
+        self.legal_actions_mask = None
+
+
+def _materialize(node, game):
+    """返回 ``node`` 的棋局状态；惰性节点在首次访问时才计算并缓存。
+
+    父节点一定已经物化（它先被选中并评估过才会展开），且 ``get_next_state``
+    是纯函数，所以惰性求值的结果与展开时立即求值完全相同。
+    """
+    state = node.state
+    if state is None:
+        parent = node.parent
+        state = game.get_next_state(parent.state, node.action_taken, parent.to_play)
+        node.state = state
+    return state
 
 
 # -- 与 MCTS 等价的树操作（自由函数版，供多棵树复用） ----------------------
 
 
-def _select(node, args):
+def _select(node, c_puct):
     """选择 PUCT 值最大的子节点（与 MCTS.select 一致）。"""
-    c_puct = args.get("c_puct", 1.5)
+    sqrt_visits = math.sqrt(node.visits)
     best_score = -float("inf")
     best_child = None
+    # 内联 q_value() 并只做一次 sqrt，避免每个子节点的方法调用与重复开方。
+    # 逐项运算顺序与 MCTS.select 完全一致，保证浮点结果逐位相同。
     for child in node.children:
-        score = -child.q_value() + c_puct * child.prior * math.sqrt(node.visits) / (1 + child.visits)
+        visits = child.visits
+        if visits:
+            q = child.value_sum / visits
+        else:
+            q = 0
+        score = -q + c_puct * child.prior * sqrt_visits / (1 + visits)
         if score > best_score:
             best_score = score
             best_child = child
     return best_child
 
 
-def _expand(node, policy, game):
-    """按照 NN Policy 展开叶节点的所有合法子节点（与 MCTS.expand 一致）。"""
-    legal_actions_mask = game.get_legal_action_mask(node.state, node.to_play)
-    for action in np.flatnonzero(legal_actions_mask):
-        next_state = game.get_next_state(node.state, action, node.to_play)
-        node.children.append(
-            Node(
-                next_state,
-                -node.to_play,
-                prior=policy[action],
-                parent=node,
-                action_taken=action,
-            )
-        )
+def _expand(node, policy, game, legal_actions_mask=None):
+    """按照 NN Policy 展开叶节点的所有合法子节点（与 MCTS.expand 一致）。
+
+    子节点的 ``state`` 先留空，真正访问时再由 ``_materialize`` 计算，避免为
+    那些永远不会被访问到的分支拷贝棋盘。
+    """
+    if legal_actions_mask is None:
+        legal_actions_mask = game.get_legal_action_mask(_materialize(node, game), node.to_play)
+    next_to_play = -node.to_play
+    children = node.children
+    # tolist() 把 numpy 标量转成 Python int，后续索引/divmod 更快。
+    for action in np.flatnonzero(legal_actions_mask).tolist():
+        children.append(_Node(None, next_to_play, policy[action], node, action))
 
 
 def _backpropagate(node, value):
     """沿路径回传 value 并翻转视角（与 MCTS.backpropagate 一致）。"""
     while node is not None:
-        node.update(value)
+        node.value_sum += value
+        node.visits += 1
         value = -value
         node = node.parent
+
+
+def _discard_tree(root):
+    """丢弃一棵搜索树：断开 ``parent`` 反向引用，消除父子引用环。
+
+    ``children`` 与 ``parent`` 互相引用会形成环，Python 的循环 GC 必须反复
+    扫描这些海量节点。搜索结束时主动断环后，整棵树可被引用计数立即释放，
+    后续在 selfplay 热路径里关闭循环 GC 也不会造成内存泄漏。
+    """
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        stack.extend(node.children)
+        node.parent = None
 
 
 # -- 单局的搜索 / 对局状态机 ------------------------------------------------
@@ -58,8 +132,10 @@ class _Search:
     非终局叶子挂起等待 NN 评估。
     """
 
+    __slots__ = ("root", "num_simulations", "simulations", "pending")
+
     def __init__(self, state, to_play, num_simulations):
-        self.root = Node(state, to_play)
+        self.root = _Node(state, to_play)
         self.num_simulations = num_simulations
         self.simulations = 0
         self.pending = None  # 等待 NN 评估的节点（根节点评估也走这里）
@@ -76,9 +152,37 @@ class _GameSession:
       展开 + 回传后继续。
     """
 
+    __slots__ = (
+        "game",
+        "args",
+        "action_size",
+        "c_puct",
+        "num_simulations",
+        "half_life",
+        "dirichlet_concentration",
+        "dirichlet_noise_weight",
+        "state",
+        "to_play",
+        "memory",
+        "search",
+        "result",
+    )
+
     def __init__(self, game, args):
         self.game = game
         self.args = args
+        # 每局固定不变的超参数在构造时解析一次，避免每次模拟都查 args。
+        self.action_size = game.board_size ** 2
+        self.c_puct = args.get("c_puct", 1.5)
+        self.num_simulations = int(
+            args.get("num_simulations", 1.7 * game.board_size ** 2)
+        )
+        self.half_life = args.get("half_life", game.board_size)
+        self.dirichlet_concentration = args.get(
+            "dirichlet_total_concentration", 0.03 * game.board_size ** 2
+        )
+        self.dirichlet_noise_weight = args.get("dirichlet_noise_weight", 0.25)
+
         self.state = game.get_initial_state()
         self.to_play = 1
         self.memory = []
@@ -87,11 +191,8 @@ class _GameSession:
 
     # -- 搜索生命周期 -----------------------------------------------------
 
-    def _num_simulations(self):
-        return int(self.args.get("num_simulations", 1.7 * self.game.board_size ** 2))
-
     def _start_search(self):
-        search = _Search(self.state, self.to_play, self._num_simulations())
+        search = _Search(self.state, self.to_play, self.num_simulations)
         search.pending = search.root  # 根节点评估最先入队
         self.search = search
         return search.root
@@ -99,7 +200,8 @@ class _GameSession:
     def _finish_move(self):
         """搜索结束：记录样本、按温度选动作落子、判断终局。"""
         search = self.search
-        mcts_policy = np.zeros(self.game.board_size ** 2)
+        game = self.game
+        mcts_policy = np.zeros(self.action_size)
         for child in search.root.children:
             mcts_policy[child.action_taken] = child.visits
         mcts_policy /= np.sum(mcts_policy)
@@ -110,27 +212,31 @@ class _GameSession:
             "mcts_policy": mcts_policy,
         })
 
-        half_life = self.args.get("half_life", self.game.board_size)
-        if len(self.memory) < half_life:
-            action = np.random.choice(len(mcts_policy), p=mcts_policy)
+        if len(self.memory) < self.half_life:
+            action = np.random.choice(self.action_size, p=mcts_policy)
         else:
             action = int(np.argmax(mcts_policy))
 
-        self.state = self.game.get_next_state(self.state, action, self.to_play)
+        # 本步的搜索树已用完（样本已记录、策略已取出），主动断环立即释放。
+        _discard_tree(search.root)
+
+        self.state = game.get_next_state(self.state, action, self.to_play)
         self.to_play = -self.to_play
         self.search = None
 
-        if self.game.is_terminal(self.state, self.to_play):
-            winner = self.game.get_winner(self.state, self.to_play)
+        if game.is_terminal(self.state, self.to_play):
+            winner = game.get_winner(self.state, self.to_play)
+            encode_state = game.encode_state
+            memory = self.memory
             samples = [
                 {
-                    "encoded_state": self.game.encode_state(sample["state"], sample["to_play"]),
+                    "encoded_state": encode_state(sample["state"], sample["to_play"]),
                     "policy_target": sample["mcts_policy"],
                     "value_target": float(winner) * sample["to_play"],
                 }
-                for sample in self.memory
+                for sample in memory
             ]
-            self.result = (samples, winner, len(self.memory))
+            self.result = (samples, winner, len(memory))
 
     # -- 状态机入口 -------------------------------------------------------
 
@@ -154,15 +260,19 @@ class _GameSession:
                 requests.append((self, self._start_search()))
                 return False
 
+            game = self.game
+            c_puct = self.c_puct
             node = search.root
             while node.children:
-                node = _select(node, self.args)
+                node = _select(node, c_puct)
 
             # 一次模拟 = 走到一个叶子；终局叶子直接回传，非终局叶子挂起等
             # 批量评估（评估由 deliver 完成），两种情况都计一次模拟。
             search.simulations += 1
-            if self.game.is_terminal(node.state, node.to_play):
-                value = self.game.get_winner(node.state, node.to_play) * node.to_play
+            # 选中叶子时才真正算出它的棋局状态（惰性展开）。
+            state = _materialize(node, game)
+            if game.is_terminal(state, node.to_play):
+                value = game.get_winner(state, node.to_play) * node.to_play
                 _backpropagate(node, value)
                 continue
 
@@ -174,14 +284,21 @@ class _GameSession:
     def deliver(self, node, policy, value):
         """把批量推理结果交给挂起的节点：根节点加噪声，然后展开 + 回传。"""
         search = self.search
+        # 合法动作 mask 在批量推理时已经算过并挂在 node 上，这里直接复用。
+        legal_actions_mask = getattr(node, "legal_actions_mask", None)
+        if legal_actions_mask is None:
+            game = self.game
+            legal_actions_mask = game.get_legal_action_mask(
+                _materialize(node, game), node.to_play
+            )
         if node is search.root:
             policy = add_dirichlet_noise(
                 policy,
-                self.args.get("dirichlet_total_concentration", 0.03 * self.game.board_size ** 2),
-                legal_actions_mask=self.game.get_legal_action_mask(node.state, node.to_play),
-                noise_weight=self.args.get("dirichlet_noise_weight", 0.25),
+                self.dirichlet_concentration,
+                legal_actions_mask=legal_actions_mask,
+                noise_weight=self.dirichlet_noise_weight,
             )
-        _expand(node, policy, self.game)
+        _expand(node, policy, self.game, legal_actions_mask)
         _backpropagate(node, value)
         search.pending = None
 
@@ -218,6 +335,9 @@ class ParallelSelfPlayer:
         self.model = model.to(device).eval()
         self.device = device
         self.num_parallel_games = max(1, int(args.get("num_parallel_games", 32)))
+        self.action_size = game.board_size ** 2
+        size = game.board_size
+        self.input_shape = (game.num_planes, size, size)
 
     @torch.inference_mode()
     def _batch_inference(self, nodes):
@@ -225,41 +345,80 @@ class ParallelSelfPlayer:
 
         与 ``MCTS.nn_inference`` 语义一致：先 mask 非法动作再 softmax。
         """
-        encoded = np.stack([self.game.encode_state(node.state, node.to_play) for node in nodes])
-        tensor = torch.from_numpy(encoded).to(dtype=torch.float32, device=self.device)
-        policy_logits, values = self.model(tensor)
+        game = self.game
+        n = len(nodes)
+        action_size = self.action_size
 
-        logits_batch = policy_logits.reshape(len(nodes), -1).cpu().numpy()
-        values_batch = values.reshape(-1).cpu().numpy()
-        results = []
-        for node, logits, value in zip(nodes, logits_batch, values_batch):
-            logits = self.game.mask_illegal_actions(node.state, node.to_play, logits)
-            results.append((softmax(logits), float(value)))
-        return results
+        # 直接构造 float32 的 batch（省掉先堆 int8 再转 float32 的一遍拷贝）。
+        encoded = np.empty((n,) + self.input_shape, dtype=np.float32)
+        masks = np.empty((n, action_size), dtype=bool)
+        encode_state = game.encode_state
+        get_legal_action_mask = game.get_legal_action_mask
+        for i, node in enumerate(nodes):
+            state = _materialize(node, game)
+            to_play = node.to_play
+            encoded[i] = encode_state(state, to_play)
+            mask = get_legal_action_mask(state, to_play)
+            masks[i] = mask
+            node.legal_actions_mask = mask  # 供 deliver/_expand 复用
+
+        policy_logits, values = self.model(torch.from_numpy(encoded).to(self.device))
+
+        # 一次性完成 mask + softmax，逐行结果与 utils.softmax 逐位一致。
+        logits = policy_logits.reshape(n, -1).float().cpu().numpy().astype(np.float64)
+        logits[~masks] = -np.inf
+        logits -= logits.max(axis=1, keepdims=True)
+        np.exp(logits, out=logits)
+        logits /= logits.sum(axis=1, keepdims=True)
+
+        values = values.reshape(-1).float().cpu().numpy()
+        return [(logits[i], float(values[i])) for i in range(n)]
 
     def run(self, total_games):
         """收集 ``total_games`` 局，按完成顺序 yield (samples, winner, game_len)。"""
-        active = []
-        started = 0
-        while started < total_games or active:
-            # 池子持续补充：谁下完了立刻开新局，直到攒够 total_games
-            while len(active) < self.num_parallel_games and started < total_games:
-                active.append(_GameSession(self.game, self.args))
-                started += 1
+        game = self.game
+        args = self.args
+        num_parallel_games = self.num_parallel_games
+        batch_inference = self._batch_inference
 
-            # 每个活跃对局推进到恰好需要一个评估（或下完）
-            requests = []
-            for session in active:
-                session.advance(requests)
+        # selfplay 阶段会产生海量短生命周期的树节点。树在丢弃前会用
+        # ``_discard_tree`` 主动断环，可被引用计数立即释放，因此这里关掉循环
+        # GC 不会泄漏，却能省掉反复扫描/晋升这些节点的巨大开销；退出时恢复
+        # （嵌套调用也安全，gc 内部用计数管理）。
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        try:
+            active = []
+            started = 0
+            while started < total_games or active:
+                # 池子持续补充：谁下完了立刻开新局，直到攒够 total_games
+                while len(active) < num_parallel_games and started < total_games:
+                    active.append(_GameSession(game, args))
+                    started += 1
 
-            finished = [s for s in active if s.result is not None]
-            active = [s for s in active if s.result is None]
+                # 每个活跃对局推进到恰好需要一个评估（或下完）
+                requests = []
+                for session in active:
+                    session.advance(requests)
 
-            # 所有挂起请求合并成一次前向，再分发回去
-            if requests:
-                results = self._batch_inference([node for _, node in requests])
-                for (session, node), (policy, value) in zip(requests, results):
-                    session.deliver(node, policy, value)
+                finished = []
+                remaining = []
+                for session in active:
+                    if session.result is None:
+                        remaining.append(session)
+                    else:
+                        finished.append(session.result)
+                active = remaining
 
-            for session in finished:
-                yield session.result
+                # 所有挂起请求合并成一次前向，再分发回去
+                if requests:
+                    results = batch_inference([node for _, node in requests])
+                    for (session, node), (policy, value) in zip(requests, results):
+                        session.deliver(node, policy, value)
+
+                for result in finished:
+                    yield result
+        finally:
+            if gc_was_enabled:
+                gc.enable()
