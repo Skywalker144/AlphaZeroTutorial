@@ -45,11 +45,13 @@ python -m pytest tests/ -q
 
 ## 配置与训练产物
 
-训练配置分别位于 [tictactoe/train.py](tictactoe/train.py) 和 [gomoku/train.py](gomoku/train.py) 的 `train_args` 中；当前没有单独的 `config.py` 或命令行参数解析。
+训练配置分别位于 [tictactoe/train.py](tictactoe/train.py) 和 [gomoku/train.py](gomoku/train.py) 的 `train_args` 中；当前没有单独的 `config.py` 或命令行参数解析。训练产物默认生成在对应游戏目录下的 `data/`，例如运行 `python -m tictactoe.train` 会写入 `tictactoe/data/`，内含 `models/`、`checkpoints/` 和统计图片。
 
-- 默认持续训练，`Ctrl+C` 会保存 `checkpoint_final.pth` 和曲线后退出。有限轮数运行可在 `train_args` 中设置 `num_iterations`；需要结束时保存则将 `save_interval` 设为合适的间隔。
-- 训练开始时自动读取当前游戏输出目录内修改时间最新的 checkpoint。开启独立实验时使用不同的 `data_dir`。
-- 模型、优化器、回放数据及部分训练统计保存在 `data/<game>/checkpoints/`，损失和自我对弈统计图保存在 `data/<game>/logs/`。这些产物不纳入 Git。
+- 迭代从 0 开始：第 0 轮收集固定的 `bootstrap_games` 局用于估计平均行长，第 1 轮据此补跑到 `min_rows`（乘以 1.05 的余量因子），之后按目标回放比自适应。
+- 默认持续训练，`Ctrl+C` 或正常结束都会保存完整 checkpoint 和曲线。`num_iterations` 表示目标总迭代数，达到后停止；不设置则持续训练。
+- 训练开始时自动恢复 `data/checkpoints/checkpoint.pth`（若存在），迭代编号、回放数据与训练统计都接着继续。开启独立实验时使用不同的 `data_dir`。
+- 每 `save_interval` 轮迭代：模型权重另存为 `data/models/model_<iter>.pth`，完整状态覆盖写入 `data/checkpoints/checkpoint.pth`（只保留最新一份，用于续训）。
+- 每个迭代结束后都会更新 `data/` 根目录下的训练面板图 `training.png`（损失、胜率、行长度的深色 2×2 dashboard），并导出可复现绘图的 `losses.csv` 与 `games.csv`。这些产物不纳入 Git。
 - 对弈入口会询问 checkpoint 路径；回车选择最新文件，没有文件时使用随机权重。落子输入为从零开始的行、列坐标。
 
 默认配置面向持续训练。仅检查流程时，应使用较小网络、较少搜索次数、较低的 `min_rows`、较小批次和有限的训练轮数；同时确保回放缓冲区能提供完整批次。
@@ -59,7 +61,7 @@ python -m pytest tests/ -q
 - 自我对弈逐局执行，搜索逐节点推理；没有并行自我对弈或批量搜索推理。
 - 自我对弈按搜索访问次数分布采样落子，没有随对局进度变化的温度调度；对弈入口按最大访问次数选择动作，但目前沿用训练配置中的根节点噪声。
 - 回放窗口随累计数据量增长，采样局数按目标回放比调度，属于基础 AlphaZero 流程之外的训练策略。
-- checkpoint 尚未保存完整配置、随机数状态和全局迭代编号；恢复训练后迭代编号从 1 开始，保存时可能覆盖同名编号文件，因此不保证逐步精确复现。
+- checkpoint 尚未保存完整配置与随机数状态，因此不保证逐步精确复现；全局迭代编号会随 checkpoint 保存并在续训时恢复。
 - 自我对弈中的黑白胜率与训练损失用于观察流程，不代表相对于固定对手的棋力；当前没有自动化棋力评估入口。
 
 原始算法参考：[AlphaZero 论文](https://arxiv.org/abs/1712.01815)。当前实现的配置、训练策略和运行规模不等同于论文实验。

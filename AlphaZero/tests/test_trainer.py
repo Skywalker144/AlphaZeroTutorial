@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from alphazero import AlphaZero
+from alphazero.metrics import MetricsTracker
 from envs.tictactoe import TicTacToe
 
 
@@ -33,8 +34,10 @@ def tiny_args(tmp_path):
 class TestSelfplay:
     def test_generates_terminal_game(self, tiny_args):
         az = AlphaZero(TicTacToe(), tiny_args)
-        game_data = az.selfplay()
+        game_data, winner, game_len = az.selfplay()
         assert len(game_data) > 0
+        assert game_len == len(game_data)
+        assert winner in (-1, 0, 1)
         for sample in game_data:
             assert sample["encoded_state"].shape == (3, 3, 3)
             assert sample["policy_target"].shape == (9,)
@@ -45,7 +48,7 @@ class TestSelfplay:
     def test_training_returns_shared_model_to_eval_mode(self, tiny_args):
         args = {**tiny_args, "batch_size": 1, "min_rows": 1}
         az = AlphaZero(TicTacToe(), args)
-        az.replay_buffer.add_game(az.selfplay())
+        az.replay_buffer.add_game(az.selfplay()[0])
 
         assert az.train_step() is not None
         assert not az.model.training
@@ -58,8 +61,7 @@ class TestSelfplay:
 class TestValueTargets:
     def test_value_target_from_player_view(self, tiny_args):
         az = AlphaZero(TicTacToe(), tiny_args)
-        game_data = az.selfplay()
-        winner = az.last_game_result[0]
+        game_data, winner, _ = az.selfplay()
         for sample in game_data:
             to_play = 1 if sample["encoded_state"][2].all() else -1
             assert sample["value_target"] == float(winner) * to_play
@@ -70,34 +72,84 @@ class TestCheckpoint:
         az = AlphaZero(TicTacToe(), tiny_args)
 
         for _ in range(3):
-            az.replay_buffer.add_game(az.selfplay())
+            az.replay_buffer.add_game(az.selfplay()[0])
             az.train_step()
-        az._target_cum = 123.5
-        az._rpg_history.append((2, 12))
+        az.metrics.record_game(1, 1, 5, 0)
+        az.metrics.record_losses(1.0, 0.6, 0.4)
+        az.scheduler.record_iteration(games_played=2, rows_produced=12)
+        az.scheduler.games_to_order(total_rows_produced=12)
 
-        az.save_checkpoint("roundtrip.pth")
-        path = os.path.join(tiny_args["data_dir"], "checkpoints", "roundtrip.pth")
+        az.iteration = 7
+        az.save_checkpoint()
+        path = os.path.join(tiny_args["data_dir"], "checkpoints", "checkpoint.pth")
         assert os.path.exists(path)
 
         az2 = AlphaZero(TicTacToe(), tiny_args)
         assert az2.load_checkpoint(path)
         for p1, p2 in zip(az.model.parameters(), az2.model.parameters()):
             assert torch.equal(p1.data, p2.data)
+        assert az2.iteration == 7
         assert az2.game_count == az.game_count
-        assert az2._target_cum == az._target_cum
-        assert list(az2._rpg_history) == list(az._rpg_history)
+        assert az2.scheduler.state() == az.scheduler.state()
+        assert az2.metrics.game_records == az.metrics.game_records
+        assert az2.metrics.losses == az.metrics.losses
         assert az2.replay_buffer.total_samples_added == az.replay_buffer.total_samples_added
 
-    def test_load_latest_when_no_filename(self, tiny_args):
+    def test_load_default_path(self, tiny_args):
         az = AlphaZero(TicTacToe(), tiny_args)
-        az.save_checkpoint("a.pth")
+        az.save_checkpoint()
         assert az.load_checkpoint() is True
+
+
+class TestMetricsTracker:
+    def _tracker_with_games(self, n, winner_pattern=(1, -1, 0), start=1):
+        from alphazero.metrics import MetricsTracker
+
+        tracker = MetricsTracker(winrate_window=3, winrate_sample_every=2)
+        for i in range(n):
+            tracker.record_game(
+                start + i, winner_pattern[i % len(winner_pattern)], 10 + i, i
+            )
+        return tracker
+
+    def test_winrate_summary(self):
+        assert MetricsTracker.winrate_summary([]) == (0.0, 0.0, 0.0)
+        b, d, w = MetricsTracker.winrate_summary([1, 1, -1, 0])
+        assert b == 0.5 and w == 0.25 and abs(d - 0.25) < 1e-12
+
+    def test_winrate_history_uses_rolling_window(self):
+        tracker = self._tracker_with_games(6)
+        history = tracker.winrate_history()
+        # 采样点: game 2、4、6
+        assert [h[0] for h in history] == [2, 4, 6]
+        # game 4 的窗口是 games 2-4: 胜者 (-1, 0, 1)
+        game4 = history[1]
+        assert game4[1] == pytest.approx(1 / 3)  # black
+        assert game4[2] == pytest.approx(1 / 3)  # draw
+        assert game4[3] == pytest.approx(1 / 3)  # white
+
+    def test_state_roundtrip(self):
+        tracker = self._tracker_with_games(3)
+        tracker.record_losses(1.0, 0.6, 0.4)
+        fresh = MetricsTracker(winrate_window=3, winrate_sample_every=2)
+        fresh.load_state(tracker.state())
+        assert fresh.game_records == tracker.game_records
+        assert fresh.losses == tracker.losses
+
+    def test_rolling_mean_matches_naive(self):
+        from alphazero.plots import _rolling_mean
+
+        values = [3.0, 1.0, 4.0, 1.0, 5.0]
+        means = _rolling_mean(values, 3)
+        naive = [sum(values[max(0, i - 2): i + 1]) / min(i + 1, 3) for i in range(len(values))]
+        assert list(means) == naive
+        assert list(_rolling_mean([1.0, 2.0], 3)) == [1.0, 1.5]
 
 
 class TestReplayBuffer:
     def test_not_ready_below_min(self, tiny_args):
         az = AlphaZero(TicTacToe(), tiny_args)
-        az.replay_buffer.add_game(az.selfplay())
+        az.replay_buffer.add_game(az.selfplay()[0])
         assert not az.replay_buffer.is_ready()
         assert az.train_step() is None
 
@@ -153,75 +205,59 @@ class TestReplayBuffer:
         assert seen == set(range(10))
 
 
-class TestAdaptiveGames:
+class TestLearnLoop:
     def _make_az(self, args):
         return AlphaZero(TicTacToe(), args)
-
-    def test_target_cum_seeds_with_min_rows(self, tiny_args):
-        az = self._make_az(tiny_args)
-        needed = tiny_args["train_steps"] * tiny_args["batch_size"] / tiny_args["replay_ratio"]
-        az._rpg_history.append((2, 8))
-        assert az._next_target_cum() == max(tiny_args["min_rows"], needed)
-        assert az._next_target_cum() == max(tiny_args["min_rows"], needed) + needed
-
-    def test_rows_per_game_fallback_is_board_area(self, tiny_args):
-        az = self._make_az(tiny_args)
-        assert az._rows_per_game() == float(TicTacToe().board_size ** 2)
-
-    def test_cold_start_orders_bootstrap_games(self, tiny_args):
-        az = self._make_az(tiny_args)
-        assert az._games_to_order() == tiny_args["bootstrap_games"]
-
-    def test_rows_per_game_uses_last_iter(self, tiny_args):
-        az = self._make_az(tiny_args)
-        az._rpg_history.append((100, 500))
-        az._rpg_history.append((5, 10))
-        assert az._rows_per_game() == 2.0
-
-    def test_rows_per_game_skips_invalid_last(self, tiny_args):
-        az = self._make_az(tiny_args)
-        az._rpg_history.append((0, 0))
-        az._rpg_history.append((100, 500))
-        assert az._rows_per_game() == 5.0
-
-    def test_iter1_fills_min_rows(self, tiny_args):
-        import math
-
-        az = self._make_az(tiny_args)
-        az._games_to_order()
-        rpg0 = 4.0
-        az._rpg_history.append((2, 8))
-        az.game_count = 2
-        az.replay_buffer.total_samples_added = 8
-        needed = tiny_args["train_steps"] * tiny_args["batch_size"] / tiny_args["replay_ratio"]
-        target = max(tiny_args["min_rows"], needed)
-        assert az._games_to_order() == math.ceil((target - 8) / rpg0)
-
-    def test_orders_zero_when_production_ahead(self, tiny_args):
-        az = self._make_az(tiny_args)
-        az._rpg_history.append((100, 500))
-        az.replay_buffer.total_samples_added = 10 ** 9
-        assert az._games_to_order() == 0
 
     def test_learn_runs_adaptive(self, tiny_args):
         args = {**tiny_args, "num_iterations": 2, "min_rows": 10, "batch_size": 8}
         az = self._make_az(args)
         az.learn()
         assert az.game_count > 0
-        assert len(az.losses["total"]) >= 1
+        assert len(az.metrics.losses["total"]) >= 1
         assert len(az.replay_buffer) > 0
+        assert len(az.metrics.game_records) == az.game_count
 
     def test_learn_interrupted_saves_final(self, tiny_args, monkeypatch):
         args = dict(tiny_args)
         args.pop("num_iterations")
         az = self._make_az(args)
 
-        def interrupt():
+        def interrupt(total_rows_produced):
             raise KeyboardInterrupt()
 
-        monkeypatch.setattr(az, "_games_to_order", interrupt)
+        monkeypatch.setattr(az.scheduler, "games_to_order", interrupt)
         with pytest.raises(KeyboardInterrupt):
             az.learn()
         assert os.path.exists(
-            os.path.join(args["data_dir"], "checkpoints", "checkpoint_final.pth")
+            os.path.join(args["data_dir"], "checkpoints", "checkpoint.pth")
         )
+
+    def test_learn_saves_model_each_interval(self, tiny_args):
+        args = {**tiny_args, "num_iterations": 3, "save_interval": 2}
+        az = self._make_az(args)
+        az.learn()
+        models_dir = os.path.join(args["data_dir"], "models")
+        assert os.path.exists(os.path.join(models_dir, "model_0.pth"))
+        assert not os.path.exists(os.path.join(models_dir, "model_1.pth"))
+        assert os.path.exists(os.path.join(models_dir, "model_2.pth"))
+
+    def test_plots_written_under_data_dir(self, tiny_args):
+        args = {**tiny_args, "num_iterations": 2, "min_rows": 10, "batch_size": 8}
+        az = self._make_az(args)
+        az.learn()
+        assert os.path.exists(os.path.join(args["data_dir"], "training.png"))
+        assert os.path.exists(os.path.join(args["data_dir"], "losses.csv"))
+        assert os.path.exists(os.path.join(args["data_dir"], "games.csv"))
+        assert not os.path.exists(os.path.join(args["data_dir"], "logs"))
+
+    def test_learn_resumes_iteration(self, tiny_args):
+        args = {**tiny_args, "num_iterations": 2}
+        az = self._make_az(args)
+        az.learn()
+        assert az.iteration == 2
+
+        resumed = self._make_az(args)
+        resumed.learn()
+        assert resumed.iteration == 2
+        assert resumed.game_count == az.game_count

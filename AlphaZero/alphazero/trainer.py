@@ -1,13 +1,6 @@
-import itertools
-import math
 import os
 import time
-from collections import deque
-
-import matplotlib
-
-matplotlib.use("Agg")
-from matplotlib import pyplot as plt
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -15,9 +8,145 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .mcts import MCTS
+from .metrics import MetricsTracker
 from .network import ResNet
 from .replay_buffer import ReplayBuffer
+from .scheduler import SelfPlayScheduler
 from .utils import auto_device, random_augment_batch
+
+
+@dataclass
+class CollectStats:
+    """Aggregates for the games collected inside a single iteration."""
+
+    game_lens: list = field(default_factory=list)
+    sample_lens: list = field(default_factory=list)
+    winners: list = field(default_factory=list)
+
+    def add(self, game_len, sample_len, winner):
+        self.game_lens.append(game_len)
+        self.sample_lens.append(sample_len)
+        self.winners.append(winner)
+
+    @property
+    def rows(self):
+        return sum(self.sample_lens)
+
+
+class Reporter:
+    """Every console message emitted during training lives here.
+
+    Configuration (all optional, read from `args`):
+
+    verbose
+        Full output when True. When False only two lines per iteration are
+        kept: the `=== Iter ... ===` header and the final `[Train]` result.
+        Per-game selfplay progress, the `[Stats]` line, buffer/skip notices
+        and checkpoint paths are suppressed.
+    log_every
+        Print a selfplay progress line every `log_every` games. 0 (default)
+        keeps the old cadence of `games // 5`.
+    show_progress
+        Whether to render the tqdm bar for the training loop.
+    """
+
+    def __init__(self, verbose=True, log_every=0, show_progress=True):
+        self.verbose = verbose
+        self.log_every = max(0, int(log_every))
+        self.show_progress = show_progress
+        self._pbar = None
+
+    # -- iteration header -------------------------------------------------
+
+    def iteration_started(self, i, games, game_count, total_samples, window_size):
+        print(f"\n=== Iter {i} | collect {games} games ===", flush=True)
+        if self.verbose:
+            print(
+                f"[Stats] total_games={game_count} "
+                f"total_samples={total_samples} window={window_size}",
+                flush=True,
+            )
+
+    # -- selfplay ---------------------------------------------------------
+
+    def selfplay_progress(self, i, done, total, t0, stats):
+        if not self.verbose:
+            return
+        every = self.log_every or max(1, total // 5)
+        if done % every and done != total:
+            return
+        dt = max(1e-9, time.time() - t0)
+        sps = stats.rows / dt
+        gw = max(2, len(str(total)))
+        head = f"[SelfPlay] Iter={i} Games={done:0{gw}d}/{total} Sps={sps:.1f}"
+        if stats.game_lens:
+            arr = np.asarray(stats.game_lens, dtype=np.float64)
+            black, draw, white = MetricsTracker.winrate_summary(stats.winners)
+            head += (
+                f" GameLen:Avg={arr.mean():.1f} Min={int(arr.min())} "
+                f"Max={int(arr.max())} Std={int(round(arr.std()))} "
+                f"Rows={stats.rows} "
+                f"BDW={int(round(black * 100)):02d}/"
+                f"{int(round(draw * 100)):02d}/"
+                f"{int(round(white * 100)):02d}"
+            )
+        else:
+            head += " GameLen=N/A BDW=N/A"
+        print(head, flush=True)
+
+    # -- training ---------------------------------------------------------
+
+    def train_skipped(self, i, total_samples, min_rows):
+        if not self.verbose:
+            return
+        print(
+            f"[Train] iter={i} skipped (buffer not ready: "
+            f"{total_samples} < {min_rows})",
+            flush=True,
+        )
+
+    def train_progress(self, i, train_steps):
+        if not self.show_progress:
+            return range(train_steps)
+        self._pbar = tqdm(range(train_steps), desc=f"Train Iter={i}")
+        return self._pbar
+
+    def train_step_done(self, steps_done, total_loss):
+        if self._pbar is not None:
+            self._pbar.set_postfix(loss=f"{total_loss / steps_done:.4f}")
+
+    def train_progress_finished(self):
+        if self._pbar is not None:
+            self._pbar.close()
+            self._pbar = None
+
+    def train_done(self, i, steps, elapsed, total, policy, value):
+        print(
+            f"[Train] iter={i} steps={steps} t={elapsed:.1f}s | "
+            f"total={total:.4f} policy={policy:.4f} value={value:.4f}",
+            flush=True,
+        )
+
+    # -- lifecycle --------------------------------------------------------
+
+    def checkpoint_saved(self, path):
+        if self.verbose:
+            print(f"Checkpoint saved to {path}")
+
+    def model_saved(self, path):
+        if self.verbose:
+            print(f"Model saved to {path}")
+
+    def checkpoint_loaded(self, path):
+        if self.verbose:
+            print(f"Checkpoint loaded from {path}")
+
+    def no_checkpoint(self):
+        if self.verbose:
+            print("No checkpoint found, starting from scratch.")
+
+    def interrupted(self):
+        print("\nStopping... saving final checkpoint and plots", flush=True)
 
 
 class AlphaZero:
@@ -38,48 +167,32 @@ class AlphaZero:
         )
         self.mcts = MCTS(game, args, self.model, self.device)
         self.replay_buffer = ReplayBuffer(
-            min_rows=args.get("min_rows", 20000),
+            min_rows=args.get("min_rows", 30000),
             taper_window_exponent=args.get("taper_window_exponent", 0.675),
             expand_window_per_row=args.get("expand_window_per_row", 0.4),
             max_rows=args.get("max_rows", None),
         )
         self.replay_ratio = args.get("replay_ratio", 8)
-        self.bootstrap_games = args.get("bootstrap_games", 200)
-        self.game_count = 0
-        self.losses = {"total": [], "policy": [], "value": []}
-        self._target_cum = 0.0
-        self._rpg_history = deque(maxlen=20)
-        self._winrate_sample_every = args.get("winrate_sample_every", 10)
-        stats_window = args.get("stats_window", 300)
-        self._recent_game_lengths = deque(maxlen=stats_window)
-        self._black_win_counts = deque(maxlen=stats_window)
-        self._white_win_counts = deque(maxlen=stats_window)
-        self.winrate_history = []
-        self.game_length_history = []
-
-    def _next_target_cum(self):
-        needed = (
-            self.args.get("train_steps", 500) * self.args.get("batch_size", 128)
+        rows_needed_per_iteration = (
+            args.get("train_steps", 200) * args.get("batch_size", 128)
         ) / self.replay_ratio
-        if self._target_cum <= 0.0:
-            self._target_cum = max(float(self.args.get("min_rows", 20000)), needed)
-        else:
-            self._target_cum += needed
-        return self._target_cum
-
-    def _rows_per_game(self):
-        for g, r in reversed(self._rpg_history):
-            if g > 0 and r > 0:
-                return r / g
-        return float(self.game.board_size ** 2)
-
-    def _games_to_order(self):
-        if not self._rpg_history:
-            return self.bootstrap_games
-        target_cum = self._next_target_cum()
-        deficit = target_cum - self.replay_buffer.total_samples_added
-        rpg = self._rows_per_game()
-        return math.ceil(deficit / rpg) if deficit > 0 else 0
+        self.scheduler = SelfPlayScheduler(
+            bootstrap_games=args.get("bootstrap_games", 200),
+            min_rows=args.get("min_rows", 30000),
+            rows_needed_per_iteration=rows_needed_per_iteration,
+            fallback_rows_per_game=float(game.board_size ** 2),
+        )
+        self.game_count = 0
+        self.iteration = 0
+        self.metrics = MetricsTracker(
+            winrate_window=args.get("stats_window", 300),
+            winrate_sample_every=args.get("winrate_sample_every", 10),
+        )
+        self.reporter = Reporter(
+            verbose=args.get("verbose", True),
+            log_every=args.get("log_every", 0),
+            show_progress=args.get("show_progress", True),
+        )
 
     def selfplay(self):
         memory = []
@@ -87,7 +200,10 @@ class AlphaZero:
         to_play = 1
         while not self.game.is_terminal(state, to_play):
 
-            mcts_policy = self.mcts.search(state, to_play, self.args.get("num_simulations", 1.7 * self.game.board_size ** 2))
+            mcts_policy = self.mcts.search(
+                state, to_play,
+                num_simulations=self.args.get("num_simulations", 1.7 * self.game.board_size ** 2)
+            )
 
             memory.append({
                 "state": state,
@@ -105,8 +221,7 @@ class AlphaZero:
             to_play = -to_play
 
         winner = self.game.get_winner(state, to_play)
-        self.last_game_result = (winner, len(memory))
-        return [
+        samples = [
             {
                 "encoded_state": self.game.encode_state(sample["state"], sample["to_play"]),
                 "policy_target": sample["mcts_policy"],
@@ -114,6 +229,7 @@ class AlphaZero:
             }
             for sample in memory
         ]
+        return samples, winner, len(memory)
 
     def train_step(self):
         batch = self.replay_buffer.sample(self.args.get("batch_size", 128))
@@ -144,230 +260,137 @@ class AlphaZero:
         self.model.eval()
         return total_loss.item(), policy_loss.item(), value_loss.item()
 
-    def _record_game_result(self, winner, game_len):
-        self._recent_game_lengths.append(game_len)
-        self.game_length_history.append((self.game_count, game_len))
-        self._black_win_counts.append(1 if winner == 1 else 0)
-        self._white_win_counts.append(1 if winner == -1 else 0)
-        if self.game_count % self._winrate_sample_every == 0:
-            total = len(self._black_win_counts)
-            if total == 0:
-                return
-            b = float(np.sum(self._black_win_counts)) / total
-            w = float(np.sum(self._white_win_counts)) / total
-            self.winrate_history.append((self.game_count, b, w, 1.0 - b - w))
-
-    def plot_metrics(self):
-        try:
-            logs_dir = os.path.join(self.args.get("data_dir", "data"), "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-
-            if self.losses["total"]:
-                plt.figure(figsize=(10, 6))
-                plt.plot(self.losses["total"], label="Total Loss")
-                plt.title("Total Training Loss")
-                plt.xlabel("Training Iteration")
-                plt.ylabel("Loss")
-                plt.yscale("log")
-                plt.legend()
-                plt.grid(True, which="both")
-                plt.savefig(os.path.join(logs_dir, "total_loss.png"), dpi=200)
-                plt.close()
-
-                plt.figure(figsize=(10, 6))
-                for key in ("policy", "value"):
-                    plt.plot(self.losses[key], label=key.replace("_", " ").title())
-                plt.title("Loss Components")
-                plt.xlabel("Training Iteration")
-                plt.ylabel("Loss")
-                plt.yscale("log")
-                plt.legend()
-                plt.grid(True, which="both")
-                plt.savefig(os.path.join(logs_dir, "loss_components.png"), dpi=200)
-                plt.close()
-
-            if self.winrate_history:
-                games, b_rates, w_rates, d_rates = zip(*self.winrate_history)
-                plt.figure(figsize=(10, 6))
-                plt.plot(games, b_rates, label="Black Win Rate", color="black")
-                plt.plot(games, w_rates, label="White Win Rate", color="red")
-                plt.plot(games, d_rates, label="Draw Rate", color="gray")
-                plt.title("Win Rates (rolling window)")
-                plt.xlabel("Game Count")
-                plt.ylabel("Rate")
-                plt.ylim(0, 1)
-                plt.legend()
-                plt.grid(True)
-                plt.savefig(os.path.join(logs_dir, "win_rates.png"), dpi=200)
-                plt.close()
-
-            if self.game_length_history:
-                games = [g for g, _ in self.game_length_history]
-                lens = [l for _, l in self.game_length_history]
-                plt.figure(figsize=(10, 6))
-                plt.plot(games, lens, alpha=0.3, linewidth=0.5, label="Per-Game Length")
-                window = min(50, len(lens))
-                if window > 0:
-                    avg_games = games[window - 1:]
-                    avg_lens = [
-                        float(np.mean(lens[i - window + 1: i + 1]))
-                        for i in range(window - 1, len(lens))
-                    ]
-                    plt.plot(avg_games, avg_lens, color="blue", linewidth=2,
-                             label=f"Avg (window {window})")
-                plt.title("Game Length (steps per game)")
-                plt.xlabel("Game Count")
-                plt.ylabel("Steps")
-                plt.legend()
-                plt.grid(True)
-                plt.savefig(os.path.join(logs_dir, "game_length.png"), dpi=200)
-                plt.close()
-        except Exception as e:
-            print(f"Plotting failed: {e}")
-
-    def _print_selfplay(self, it, games_done, total_games, t0, game_lens, sample_lens, winners):
-        dt = max(1e-9, time.time() - t0)
-        total_rows = sum(sample_lens) if sample_lens else 0
-        sps = total_rows / dt
-        gw = max(2, len(str(total_games)))
-        head = f"[SelfPlay] Iter={it} Games={games_done:0{gw}d}/{total_games} Sps={sps:.1f}"
-        if game_lens:
-            arr = np.asarray(game_lens, dtype=np.float64)
-            n = len(winners)
-            b = sum(1 for w in winners if w == 1) / n * 100
-            w = sum(1 for w_ in winners if w_ == -1) / n * 100
-            d = 100 - b - w
-            head += (f" GameLen:Avg={arr.mean():.1f} Min={int(arr.min())} "
-                     f"Max={int(arr.max())} Std={int(round(arr.std()))} "
-                     f"Rows={total_rows} "
-                     f"BDW={int(round(b)):02d}/{int(round(d)):02d}/{int(round(w)):02d}")
-        else:
-            head += " GameLen=N/A BDW=N/A"
-        print(head, flush=True)
+    # -- learn loop -------------------------------------------------------
 
     def learn(self):
         num_iterations = self.args.get("num_iterations", None)
-        train_steps = self.args.get("train_steps", 500)
-        save_interval = self.args.get("save_interval", 10)
+        save_interval = self.args.get("save_interval", 5)
+        self.load_checkpoint()
         try:
-            for i in itertools.count(1):
-                if num_iterations is not None and i > num_iterations:
-                    break
-                games = self._games_to_order()
-                bootstrap = not self._rpg_history
-                print(
-                    f"\n=== Iter {i} | collect {games} games "
-                    f"({'random bootstrap' if bootstrap else 'adaptive'}, "
-                    f"RR target={self.replay_ratio}) ===",
-                    flush=True,
-                )
-                print(
-                    f"[Stats] total_games={self.game_count} "
-                    f"total_samples={self.replay_buffer.total_samples_added}",
-                    flush=True,
-                )
-
-                game_lens, sample_lens, winners = [], [], []
-                started = time.time()
-                report_every = max(1, games // 5)
-                for gidx in range(games):
-                    game_data = self.selfplay()
-                    self.replay_buffer.add_game(game_data)
-                    winner, game_len = self.last_game_result
-                    sample_lens.append(len(game_data))
-                    game_lens.append(game_len)
-                    winners.append(winner)
-                    self.game_count += 1
-                    self._record_game_result(winner, game_len)
-                    if (gidx + 1) % report_every == 0 or gidx + 1 == games:
-                        self._print_selfplay(i, gidx + 1, games, started, game_lens, sample_lens, winners)
-                self._rpg_history.append((games, sum(sample_lens)))
-
-                if not self.replay_buffer.is_ready():
-                    print(
-                        f"[Train] iter={i} skipped (buffer not ready: "
-                        f"{self.replay_buffer.total_samples_added} < "
-                        f"{self.replay_buffer.min_rows})",
-                        flush=True,
-                    )
-                else:
-                    total_loss = policy_loss = value_loss = 0.0
-                    steps_done = 0
-                    t0 = time.time()
-                    pbar = tqdm(range(train_steps), desc=f"Train Iter={i}")
-                    for _ in pbar:
-                        res = self.train_step()
-                        if res:
-                            total_loss += res[0]
-                            policy_loss += res[1]
-                            value_loss += res[2]
-                            steps_done += 1
-                            pbar.set_postfix(loss=f"{total_loss / steps_done:.4f}")
-                    pbar.close()
-                    if steps_done:
-                        self.losses["total"].append(total_loss / steps_done)
-                        self.losses["policy"].append(policy_loss / steps_done)
-                        self.losses["value"].append(value_loss / steps_done)
-                        print(
-                            f"[Train] iter={i} steps={steps_done} "
-                            f"t={time.time() - t0:.1f}s | "
-                            f"total={self.losses['total'][-1]:.4f} "
-                            f"policy={self.losses['policy'][-1]:.4f} "
-                            f"value={self.losses['value'][-1]:.4f}",
-                            flush=True,
-                        )
-
+            while num_iterations is None or self.iteration < num_iterations:
+                i = self.iteration
+                self._run_iteration(i)
+                self.iteration = i + 1
                 if i % save_interval == 0:
-                    self.save_checkpoint(f"checkpoint_{i}.pth")
-                    self.plot_metrics()
+                    self.save_model(i)
+                    self.save_checkpoint()
+                self.plot_metrics()
         except KeyboardInterrupt:
-            print("\nStopping... saving final checkpoint and plots", flush=True)
-            self.save_checkpoint("checkpoint_final.pth")
+            self.reporter.interrupted()
+            self.save_checkpoint()
             self.plot_metrics()
             raise
+        else:
+            self.save_checkpoint()
+            self.plot_metrics()
 
-    def save_checkpoint(self, filename):
+    def _run_iteration(self, i):
+        games = self.scheduler.games_to_order(
+            self.replay_buffer.total_samples_added
+        )
+        self.reporter.iteration_started(
+            i,
+            games,
+            game_count=self.game_count,
+            total_samples=self.replay_buffer.total_samples_added,
+            window_size=self.replay_buffer.window_size(),
+        )
+        stats = self._collect_games(i, games)
+        self.scheduler.record_iteration(games, stats.rows)
+        self._train_iteration(i)
+
+    def _collect_games(self, i, games):
+        stats = CollectStats()
+        started = time.time()
+        for done in range(1, games + 1):
+            game_data, winner, game_len = self.selfplay()
+            self.replay_buffer.add_game(game_data)
+            self.game_count += 1
+            self.metrics.record_game(self.game_count, winner, game_len, i)
+            stats.add(game_len, len(game_data), winner)
+            self.reporter.selfplay_progress(i, done, games, started, stats)
+        return stats
+
+    def _train_iteration(self, i):
+        if not self.replay_buffer.is_ready():
+            self.reporter.train_skipped(
+                i,
+                self.replay_buffer.total_samples_added,
+                self.replay_buffer.min_rows,
+            )
+            return
+
+        train_steps = self.args.get("train_steps", 200)
+        t0 = time.time()
+        total_loss = policy_loss = value_loss = 0.0
+        steps_done = 0
+        try:
+            for _ in self.reporter.train_progress(i, train_steps):
+                res = self.train_step()
+                if res:
+                    total_loss += res[0]
+                    policy_loss += res[1]
+                    value_loss += res[2]
+                    steps_done += 1
+                    self.reporter.train_step_done(steps_done, total_loss)
+        finally:
+            self.reporter.train_progress_finished()
+
+        if steps_done:
+            losses = (
+                total_loss / steps_done,
+                policy_loss / steps_done,
+                value_loss / steps_done,
+            )
+            self.metrics.record_losses(*losses)
+            self.reporter.train_done(i, steps_done, time.time() - t0, *losses)
+
+    # -- io ---------------------------------------------------------------
+
+    def plot_metrics(self):
+        data_dir = self.args.get("data_dir", "data")
+        self.metrics.plot(data_dir)
+
+    def save_model(self, iteration):
+        models_dir = os.path.join(self.args.get("data_dir", "data"), "models")
+        os.makedirs(models_dir, exist_ok=True)
+        path = os.path.join(models_dir, f"model_{iteration}.pth")
+        torch.save(self.model.state_dict(), path)
+        self.reporter.model_saved(path)
+
+    def save_checkpoint(self):
         ckpt_dir = os.path.join(self.args.get("data_dir", "data"), "checkpoints")
         os.makedirs(ckpt_dir, exist_ok=True)
-        path = os.path.join(ckpt_dir, filename)
+        path = os.path.join(ckpt_dir, "checkpoint.pth")
         torch.save(
             {
+                "iteration": self.iteration,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "game_count": self.game_count,
-                "losses": self.losses,
+                "metrics": self.metrics.state(),
                 "replay_buffer": self.replay_buffer.get_state(),
-                "target_cum": self._target_cum,
-                "rpg_history": list(self._rpg_history),
+                "scheduler": self.scheduler.state(),
             },
             path,
         )
-        print(f"Checkpoint saved to {path}")
+        self.reporter.checkpoint_saved(path)
 
     def load_checkpoint(self, filename=None):
         if filename is None:
-            import glob
-
-            data_dir = self.args.get("data_dir", "data")
-            checkpoints = glob.glob(os.path.join(data_dir, "checkpoints", "*.pth"))
-            if not checkpoints:
-                print("No checkpoint found, starting from scratch.")
-                return False
-            filename = max(checkpoints, key=os.path.getmtime)
-
+            filename = os.path.join(
+                self.args.get("data_dir", "data"), "checkpoints", "checkpoint.pth"
+            )
+        if not os.path.exists(filename):
+            self.reporter.no_checkpoint()
+            return False
         checkpoint = torch.load(filename, map_location=self.device, weights_only=False)
+        self.iteration = checkpoint["iteration"]
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.game_count = checkpoint.get("game_count", 0)
-        self.losses = checkpoint.get(
-            "losses", {"total": [], "policy": [], "value": []}
-        )
-        if "replay_buffer" in checkpoint:
-            self.replay_buffer.load_state(checkpoint["replay_buffer"])
-        self._target_cum = checkpoint.get("target_cum", 0.0)
-        self._rpg_history = deque(
-            checkpoint.get("rpg_history", []), maxlen=20
-        )
-        print(f"Checkpoint loaded from {filename}")
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.game_count = checkpoint["game_count"]
+        self.metrics.load_state(checkpoint["metrics"])
+        self.replay_buffer.load_state(checkpoint["replay_buffer"])
+        self.scheduler.load_state(checkpoint["scheduler"])
+        self.reporter.checkpoint_loaded(filename)
         return True

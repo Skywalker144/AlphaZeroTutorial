@@ -18,7 +18,7 @@ class ResBlock(nn.Module):
 
 
 class ResNet(nn.Module):
-    def __init__(self, board_size, num_planes, num_blocks=4, num_channels=64):
+    def __init__(self, board_size, num_planes, num_blocks=1, num_channels=32):
         super().__init__()
         self.board_size = board_size
         self.action_size = board_size * board_size
