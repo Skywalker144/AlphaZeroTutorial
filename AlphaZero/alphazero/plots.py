@@ -157,17 +157,17 @@ def _attach_iteration_axis(axis, samples, iterations):
     if len(samples) < 2 or np.all(iterations == iterations[0]):
         return None
     unique_iterations = []
-    last_samples = []
-    for sample, iteration in zip(samples, iterations):
+    start_samples = []
+    for index, iteration in enumerate(iterations):
         if not unique_iterations or iteration != unique_iterations[-1]:
             unique_iterations.append(iteration)
-            last_samples.append(sample)
+            start_samples.append(samples[index - 1] if index else 0.0)
 
     secondary = axis.secondary_xaxis(
         "top",
         functions=(
             lambda values: np.interp(values, samples, iterations),
-            lambda values: np.interp(values, unique_iterations, last_samples),
+            lambda values: np.interp(values, unique_iterations, start_samples),
         ),
     )
     secondary.set_xlabel("Iteration", color=TEXT)
