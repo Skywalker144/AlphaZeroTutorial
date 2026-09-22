@@ -377,6 +377,7 @@ class _GameSession:
                 policy,
                 self.dirichlet_concentration,
                 legal_actions_mask=legal_actions_mask,
+                board_size=self.game.board_size,
                 noise_weight=self.dirichlet_noise_weight,
             )
         _expand(node, policy, self.game, legal_actions_mask)

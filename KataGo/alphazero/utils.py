@@ -86,7 +86,7 @@ def apply_temperature(probs, temperature):
     return result / np.sum(result)
 
 
-def add_dirichlet_noise(policy, total_concentration, legal_actions_mask, noise_weight=0.25):
+def add_dirichlet_noise(policy, total_concentration, legal_actions_mask, board_size, noise_weight=0.25):
     """
     训练时 在根节点策略中混入 Dirichlet Noise 以鼓励探索：
 
@@ -95,17 +95,27 @@ def add_dirichlet_noise(policy, total_concentration, legal_actions_mask, noise_w
     其中 total_concentration 一般可以设置为 0.03 * board_size^2
     noise_weight 一般是 0.25
     
-    只给合法动作加噪声，非法位置保持为 0。每个合法动作的浓度为 total_concentration / 合法动作数，
-    total_concentration 越小，噪声越尖锐，即越集中在少数动作上。
+    只给合法动作加噪声，非法位置保持为 0。alpha 总量为 total_concentration：一半平均分给合法动作，
+    另一半按先验取对数后的形状分配（只保留高于均值的那部分）。对数先验封顶为
+    0.01 * (19 / board_size)^2，使 19x19 上等价于 KataGo 的 0.01。
     """
-    legal_actions_count = np.sum(legal_actions_mask)
+    legal_actions_count = int(np.sum(legal_actions_mask))
     if legal_actions_count <= 1:
         return policy
-    per_action_concentration = total_concentration / legal_actions_count
-    noise = np.random.dirichlet([per_action_concentration] * legal_actions_count)
+    legal_policy = policy[legal_actions_mask]
+    prior_cap = 0.01 * (19.0 / board_size) ** 2
+    log_policy = np.log(np.minimum(prior_cap, legal_policy) + 1e-20)
+    shaped = np.maximum(0.0, log_policy - log_policy.mean())
+    shaped_sum = shaped.sum()
+    uniform = 1.0 / legal_actions_count
+    if shaped_sum <= 0.0:
+        proportions = np.full(legal_actions_count, uniform)
+    else:
+        proportions = 0.5 * (shaped / shaped_sum + uniform)
+    noise = np.random.dirichlet(proportions * total_concentration)
     noisy_policy = policy.copy()
     noisy_policy[legal_actions_mask] = (
-        (1 - noise_weight) * policy[legal_actions_mask] + noise_weight * noise
+        (1 - noise_weight) * legal_policy + noise_weight * noise
     )
     return noisy_policy
 

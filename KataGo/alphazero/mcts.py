@@ -129,6 +129,7 @@ class MCTS:
                     policy,
                     self.args.get("dirichlet_total_concentration", 0.03 * self.game.board_size ** 2),
                     legal_actions_mask=self.game.get_legal_action_mask(state, to_play),
+                    board_size=self.game.board_size,
                     noise_weight=self.args.get("dirichlet_noise_weight", 0.25),
                 )
 

@@ -50,16 +50,20 @@ class TestDirichlet:
             total_concentration=1.2,
             noise_weight=0.25,
             legal_actions_mask=np.array([True, True, True, False]),
+            board_size=3,
         )
 
-        assert np.isclose(captured["concentrations"].sum(), 1.2)
-        assert np.allclose(captured["concentrations"], 0.4)
+        concentrations = captured["concentrations"]
+        assert np.isclose(concentrations.sum(), 1.2)
+        assert concentrations[0] > concentrations[1]
+        assert np.isclose(concentrations[1], concentrations[2])
 
     def test_preserves_support(self):
         policy = np.array([0.5, 0.5, 0.0, 0.0])
         noisy = add_dirichlet_noise(
             policy, total_concentration=0.06, noise_weight=0.25,
             legal_actions_mask=np.array([True, True, False, False]),
+            board_size=3,
         )
         assert noisy[2] == 0.0 and noisy[3] == 0.0
         assert np.isclose(noisy.sum(), 1.0)
@@ -69,6 +73,7 @@ class TestDirichlet:
         assert np.array_equal(add_dirichlet_noise(
             policy, total_concentration=0.03,
             legal_actions_mask=np.array([True, False, False]),
+            board_size=3,
         ), policy)
 
     def test_noise_includes_tiny_and_underflowed_legal_probabilities(self, monkeypatch):
@@ -80,6 +85,7 @@ class TestDirichlet:
         noisy = add_dirichlet_noise(
             policy, total_concentration=0.06, noise_weight=0.25,
             legal_actions_mask=np.array([True, True, True, False]),
+            board_size=3,
         )
         assert noisy[1] > 0.08
         assert noisy[2] > 0.08
