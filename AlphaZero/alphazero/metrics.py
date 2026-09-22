@@ -1,12 +1,10 @@
 import os
 
-from .plots import render_training, winrate_history, write_metrics_csv
+from .plots import render_training, write_metrics_csv
 
 
 class MetricsTracker:
-    def __init__(self, winrate_window=300, winrate_sample_every=10):
-        self.winrate_window = winrate_window
-        self.winrate_sample_every = max(1, winrate_sample_every)
+    def __init__(self):
         self.losses = {"total": [], "policy": [], "value": []}
         self.game_records = []
 
@@ -27,22 +25,11 @@ class MetricsTracker:
         white = sum(1 for w in winners if w == -1) / n
         return black, 1.0 - black - white, white
 
-    def winrate_history(self):
-        return winrate_history(
-            self.game_records, self.winrate_window, self.winrate_sample_every
-        )
-
     def plot(self, out_dir):
         try:
             os.makedirs(out_dir, exist_ok=True)
             write_metrics_csv(out_dir, self.losses, self.game_records)
-            render_training(
-                out_dir,
-                self.losses,
-                self.game_records,
-                self.winrate_window,
-                self.winrate_sample_every,
-            )
+            render_training(out_dir, self.losses, self.game_records)
         except Exception as e:
             print(f"Plotting failed: {e}")
 

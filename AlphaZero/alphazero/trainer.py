@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .mcts import MCTS
+from .alphazero_parallel import ParallelSelfPlayer
 from .metrics import MetricsTracker
 from .network import ResNet
 from .replay_buffer import ReplayBuffer
@@ -166,6 +167,11 @@ class AlphaZero:
             weight_decay=args.get("weight_decay", 3e-4),
         )
         self.mcts = MCTS(game, args, self.model, self.device)
+        self.parallel_player = (
+            ParallelSelfPlayer(game, args, self.model, self.device)
+            if args.get("parallel", True)
+            else None
+        )
         self.replay_buffer = ReplayBuffer(
             min_rows=args.get("min_rows", 30000),
             taper_window_exponent=args.get("taper_window_exponent", 0.675),
@@ -184,10 +190,7 @@ class AlphaZero:
         )
         self.game_count = 0
         self.iteration = 0
-        self.metrics = MetricsTracker(
-            winrate_window=args.get("stats_window", 300),
-            winrate_sample_every=args.get("winrate_sample_every", 10),
-        )
+        self.metrics = MetricsTracker()
         self.reporter = Reporter(
             verbose=args.get("verbose", True),
             log_every=args.get("log_every", 0),
@@ -302,14 +305,21 @@ class AlphaZero:
     def _collect_games(self, i, games):
         stats = CollectStats()
         started = time.time()
-        for done in range(1, games + 1):
-            game_data, winner, game_len = self.selfplay()
+        for done, (game_data, winner, game_len) in enumerate(self._selfplay_games(games), 1):
             self.replay_buffer.add_game(game_data)
             self.game_count += 1
             self.metrics.record_game(self.game_count, winner, game_len, i)
             stats.add(game_len, len(game_data), winner)
             self.reporter.selfplay_progress(i, done, games, started, stats)
         return stats
+
+    def _selfplay_games(self, games):
+        """Yield (samples, winner, game_len) per game, 串行或并行后端二选一。"""
+        if self.parallel_player is not None:
+            yield from self.parallel_player.run(games)
+            return
+        for _ in range(games):
+            yield self.selfplay()
 
     def _train_iteration(self, i):
         if not self.replay_buffer.is_ready():

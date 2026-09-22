@@ -52,10 +52,11 @@ class TestSelfplay:
 
         assert az.train_step() is not None
         assert not az.model.training
-        before = az.model.start_layer[1].running_mean.detach().clone()
+        before = [p.detach().clone() for p in az.model.parameters()]
         az.selfplay()
-        after = az.model.start_layer[1].running_mean.detach()
-        assert torch.equal(after, before)
+        assert not az.model.training
+        after = [p.detach() for p in az.model.parameters()]
+        assert all(torch.equal(a, b) for a, b in zip(before, after))
 
 
 class TestValueTargets:
@@ -105,7 +106,7 @@ class TestMetricsTracker:
     def _tracker_with_games(self, n, winner_pattern=(1, -1, 0), start=1):
         from alphazero.metrics import MetricsTracker
 
-        tracker = MetricsTracker(winrate_window=3, winrate_sample_every=2)
+        tracker = MetricsTracker()
         for i in range(n):
             tracker.record_game(
                 start + i, winner_pattern[i % len(winner_pattern)], 10 + i, i
@@ -117,33 +118,25 @@ class TestMetricsTracker:
         b, d, w = MetricsTracker.winrate_summary([1, 1, -1, 0])
         assert b == 0.5 and w == 0.25 and abs(d - 0.25) < 1e-12
 
-    def test_winrate_history_uses_rolling_window(self):
-        tracker = self._tracker_with_games(6)
-        history = tracker.winrate_history()
-        # 采样点: game 2、4、6
-        assert [h[0] for h in history] == [2, 4, 6]
-        # game 4 的窗口是 games 2-4: 胜者 (-1, 0, 1)
-        game4 = history[1]
-        assert game4[1] == pytest.approx(1 / 3)  # black
-        assert game4[2] == pytest.approx(1 / 3)  # draw
-        assert game4[3] == pytest.approx(1 / 3)  # white
+    def test_iteration_means_use_each_game_and_iteration_end(self):
+        from alphazero.plots import selfplay_iteration_history
+
+        # Unequal game lengths must not weight the outcome rates. Iteration
+        # gaps and an incomplete latest iteration must preserve sample positions.
+        records = [(1, 1, 5, 0), (2, 0, 9, 0), (3, -1, 6, 2)]
+        history = selfplay_iteration_history(records)
+        assert history == [(14, 0.5, 0.5, 0.0, 7.0), (20, 0.0, 0.0, 1.0, 6.0)]
+        assert selfplay_iteration_history(records[:2]) == history[:1]
+        assert selfplay_iteration_history([]) == []
 
     def test_state_roundtrip(self):
         tracker = self._tracker_with_games(3)
         tracker.record_losses(1.0, 0.6, 0.4)
-        fresh = MetricsTracker(winrate_window=3, winrate_sample_every=2)
+        fresh = MetricsTracker()
         fresh.load_state(tracker.state())
         assert fresh.game_records == tracker.game_records
         assert fresh.losses == tracker.losses
 
-    def test_rolling_mean_matches_naive(self):
-        from alphazero.plots import _rolling_mean
-
-        values = [3.0, 1.0, 4.0, 1.0, 5.0]
-        means = _rolling_mean(values, 3)
-        naive = [sum(values[max(0, i - 2): i + 1]) / min(i + 1, 3) for i in range(len(values))]
-        assert list(means) == naive
-        assert list(_rolling_mean([1.0, 2.0], 3)) == [1.0, 1.5]
 
 
 class TestReplayBuffer:

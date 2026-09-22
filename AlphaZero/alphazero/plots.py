@@ -27,9 +27,6 @@ ORANGE = "#e8924b"
 GREEN = "#98c379"
 GREY = "#9aa2b1"
 
-_SAMPLE_LOCATOR = MaxNLocator(nbins=6, steps=[1, 2, 2.5, 5, 10])
-
-
 def apply_theme():
     plt.rcParams.update(
         {
@@ -85,112 +82,59 @@ def _empty_axis(axis, message):
         spine.set_visible(False)
 
 
-def _ema(values, span):
-    values = np.asarray(values, dtype=np.float64)
-    if len(values) == 0:
-        return values
-    alpha = 2.0 / (max(2, int(span)) + 1.0)
-    out = np.empty_like(values)
-    out[0] = values[0]
-    for index in range(1, len(values)):
-        out[index] = alpha * values[index] + (1.0 - alpha) * out[index - 1]
-    return out
+def selfplay_iteration_history(game_records):
+    """Per-iteration (end samples, black/draw/white rates, mean length).
+
+    Each game has equal weight within its iteration. A point is positioned at
+    the last recorded sample of that iteration, including a partial latest one.
+    """
+    groups = {}
+    cumulative_samples = 0
+    for _, winner, length, iteration in game_records:
+        cumulative_samples += length
+        # Games, black wins, white wins, total moves, final sample position.
+        group = groups.setdefault(iteration, [0, 0, 0, 0, 0])
+        group[0] += 1
+        group[1] += winner == 1
+        group[2] += winner == -1
+        group[3] += length
+        group[4] = cumulative_samples
+    return [
+        (end, black / count, (count - black - white) / count,
+         white / count, steps / count)
+        for count, black, white, steps, end in groups.values()
+    ]
 
 
-def _rolling_mean(values, window):
-    values = np.asarray(values, dtype=np.float64)
-    if len(values) == 0:
-        return values
-    window = max(1, int(window))
-    csum = np.concatenate(([0.0], np.cumsum(values)))
-    result = np.empty(len(values))
-    for index in range(len(values)):
-        first = max(0, index - window + 1)
-        result[index] = (csum[index + 1] - csum[first]) / (index + 1 - first)
-    return result
-
-
-def _sci_label(value, _position=None):
-    if value == 0:
-        return "0"
-    exponent = int(math.floor(math.log10(abs(value))))
-    mantissa = round(value / (10.0**exponent), 3)
-    if abs(mantissa) >= 10.0:
-        mantissa /= 10.0
-        exponent += 1
-    if mantissa == int(mantissa):
-        mantissa = int(mantissa)
-    return f"{mantissa:g}e{exponent}"
-
-
-def winrate_history(game_records, window, sample_every):
-    """Rolling black/draw/white rates sampled every `sample_every` games."""
-    if not game_records:
-        return []
-    sample_every = max(1, int(sample_every))
-    winners = np.array([winner for _, winner, _, _ in game_records])
-    cum_black = np.cumsum(winners == 1)
-    cum_white = np.cumsum(winners == -1)
-    history = []
-    for index, (game_index, _, _, _) in enumerate(game_records):
-        if game_index % sample_every:
-            continue
-        low = max(0, index + 1 - window)
-        count = index + 1 - low
-        black = (cum_black[index] - (cum_black[low - 1] if low else 0)) / count
-        white = (cum_white[index] - (cum_white[low - 1] if low else 0)) / count
-        history.append((game_index, black, 1.0 - black - white, white))
-    return history
-
-
-def _selfplay_axes_data(game_records):
-    """Cumulative self-play samples and the owning iteration per game."""
-    lengths = np.array([length for _, _, length, _ in game_records], dtype=np.float64)
-    iterations = np.array(
-        [iteration for _, _, _, iteration in game_records], dtype=np.float64
+def _style_selfplay_axis(axis, title, ylabel, total_samples):
+    _style_axis(axis, integer_x=False)
+    axis.set_title(title, loc="left", fontsize=12, pad=36)
+    axis.set_ylabel(ylabel)
+    axis.set_xlabel("Cumulative self-play samples (iteration end)")
+    axis.grid(axis="y", alpha=0.55)
+    axis.tick_params(axis="both", length=3)
+    axis.xaxis.set_major_locator(
+        MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10])
     )
-    return np.cumsum(lengths), iterations
-
-
-def _attach_iteration_axis(axis, samples, iterations):
-    """Add a top x-axis that re-expresses self-play samples as iterations."""
-    if len(samples) < 2 or np.all(iterations == iterations[0]):
-        return None
-    unique_iterations = []
-    start_samples = []
-    for index, iteration in enumerate(iterations):
-        if not unique_iterations or iteration != unique_iterations[-1]:
-            unique_iterations.append(iteration)
-            start_samples.append(samples[index - 1] if index else 0.0)
-
-    secondary = axis.secondary_xaxis(
-        "top",
-        functions=(
-            lambda values: np.interp(values, samples, iterations),
-            lambda values: np.interp(values, unique_iterations, start_samples),
-        ),
+    axis.xaxis.set_major_formatter(
+        FuncFormatter(lambda value, _: f"{value / 1000:g}k" if value else "0")
     )
-    secondary.set_xlabel("Iteration", color=TEXT)
-    secondary.xaxis.set_major_locator(MaxNLocator(integer=True))
-    secondary.tick_params(colors=MUTED, labelsize=9)
-    secondary.spines["top"].set_color(SPINE)
-    return secondary
+    axis.set_xlim(0, max(1, total_samples * 1.025))
 
 
-def _style_sample_axis(axis, samples):
-    axis.xaxis.set_major_locator(_SAMPLE_LOCATOR)
-    axis.xaxis.set_major_formatter(FuncFormatter(_sci_label))
-    if len(samples) == 1:
-        axis.set_xlim(samples[0] - 0.5, samples[0] + 0.5)
+def _selfplay_legend(axis, columns):
+    axis.legend(
+        loc="lower left", bbox_to_anchor=(0, 1.01), ncol=columns,
+        borderaxespad=0, fontsize=9, handlelength=2, columnspacing=1.5,
+    )
 
 
-def _plot_loss_series(axis, values, color, label, span):
+def _plot_loss_series(axis, values, color, label):
     if not values:
         return False
     x = np.arange(1, len(values) + 1)
     y = np.asarray(values, dtype=np.float64)
-    axis.plot(x, y, color=color, linewidth=1.0, alpha=0.35)
-    axis.plot(x, _ema(y, span), color=color, linewidth=2.0, label=label)
+    axis.plot(x, y, color=color, linewidth=1.6, label=label)
     return True
 
 
@@ -220,7 +164,7 @@ def write_metrics_csv(out_dir, losses, game_records):
             writer.writerow([game_index, iteration, winner, length, cumulative])
 
 
-def render_training(out_dir, losses, game_records, winrate_window, winrate_sample_every):
+def render_training(out_dir, losses, game_records):
     apply_theme()
     figure, axes = plt.subplots(2, 2, figsize=(15.0, 9.5), layout="constrained")
     iterations = len(losses["total"])
@@ -228,73 +172,47 @@ def render_training(out_dir, losses, game_records, winrate_window, winrate_sampl
     total_samples = int(sum(length for _, _, length, _ in game_records))
     figure.suptitle("AlphaZero training progress", fontsize=17)
     figure.supxlabel(
-        f"{iterations} training iteration(s) · {games:,} self-play game(s) · "
-        f"{total_samples:,} self-play samples · win-rate window {winrate_window} games",
+        f"{iterations} loss records · {games:,} self-play games · "
+        f"{total_samples:,} self-play samples · self-play means per iteration",
         fontsize=10,
         color=MUTED,
     )
 
-    samples = iterations_per_game = None
-    if game_records:
-        samples, iterations_per_game = _selfplay_axes_data(game_records)
+    history = selfplay_iteration_history(game_records)
+    if history:
+        samples, black, draw, white, mean_length = zip(*history)
 
     axis = axes[0, 0]
-    history = winrate_history(game_records, winrate_window, winrate_sample_every)
+    _style_selfplay_axis(axis, "Self-play outcomes", "Share of games", total_samples)
     if history:
-        sample_of_game = {
-            game_index: sample
-            for game_index, sample in zip(
-                (record[0] for record in game_records), samples
-            )
-        }
-        sample_axis = [sample_of_game[entry[0]] for entry in history]
-        _, black, draw, white = zip(*history)
-        axis.plot(sample_axis, black, color=BLUE, linewidth=2.0, label="Black")
-        axis.plot(sample_axis, white, color=RED, linewidth=2.0, label="White")
-        axis.plot(sample_axis, draw, color=GREY, linewidth=1.6, label="Draw")
-        axis.axhline(0.5, color=MUTED, linewidth=1.0, alpha=0.8)
-        axis.set_ylim(0.0, 1.0)
+        for label, color, series in (
+            ("Black win", BLUE, black),
+            ("White win", RED, white),
+            ("Draw", GREY, draw),
+        ):
+            axis.plot(samples, series, color=color, linewidth=1.8, label=label)
+        axis.set_ylim(0.0, 1.025)
+        axis.set_yticks(np.arange(0, 1.01, 0.2))
         axis.yaxis.set_major_formatter(PercentFormatter(1.0))
-        axis.legend(fontsize=9)
+        _selfplay_legend(axis, 3)
     else:
         _empty_axis(axis, "No self-play games recorded yet")
-    axis.set_title("Self-play outcome rates (rolling)")
-    axis.set_xlabel("Self-play samples")
-    axis.set_ylabel("Share of games")
-    _style_axis(axis, integer_x=False)
-    if history:
-        _style_sample_axis(axis, samples)
-        _attach_iteration_axis(axis, samples, iterations_per_game)
 
     axis = axes[0, 1]
-    if game_records:
-        lengths = np.array(
-            [length for _, _, length, _ in game_records], dtype=np.float64
-        )
-        axis.scatter(
-            samples, lengths, s=8, color=BLUE, alpha=0.22, linewidths=0, label="Per game"
-        )
-        window = min(50, len(lengths))
-        axis.plot(
-            samples,
-            _rolling_mean(lengths, window),
-            color=ORANGE,
-            linewidth=2.0,
-            label=f"Mean (window {window})",
-        )
-        axis.legend(fontsize=9)
+    _style_selfplay_axis(axis, "Self-play game length", "Moves per game", total_samples)
+    if history:
+        axis.plot(samples, mean_length, color=ORANGE, linewidth=1.8, label="Mean")
+        lengths = [length for _, _, length, _ in game_records]
+        low, high = min(lengths), max(lengths)
+        padding = max(1, high - low) * 0.05
+        axis.set_ylim(low - padding, high + padding)
+        axis.yaxis.set_major_locator(MaxNLocator(nbins=5, integer=True))
+        _selfplay_legend(axis, 1)
     else:
         _empty_axis(axis, "No self-play games recorded yet")
-    axis.set_title("Self-play game length")
-    axis.set_xlabel("Self-play samples")
-    axis.set_ylabel("Steps per game")
-    _style_axis(axis, integer_x=False)
-    if game_records:
-        _style_sample_axis(axis, samples)
-        _attach_iteration_axis(axis, samples, iterations_per_game)
 
     axis = axes[1, 0]
-    if _plot_loss_series(axis, losses["total"], ORANGE, "Total (EMA)", 20):
+    if _plot_loss_series(axis, losses["total"], ORANGE, "Total"):
         _use_log_scale(axis, [losses["total"]])
         axis.legend(fontsize=9)
     else:
@@ -305,8 +223,8 @@ def render_training(out_dir, losses, game_records, winrate_window, winrate_sampl
     _style_axis(axis)
 
     axis = axes[1, 1]
-    plotted = _plot_loss_series(axis, losses["policy"], BLUE, "Policy (EMA)", 20)
-    plotted |= _plot_loss_series(axis, losses["value"], GREEN, "Value (EMA)", 20)
+    plotted = _plot_loss_series(axis, losses["policy"], BLUE, "Policy")
+    plotted |= _plot_loss_series(axis, losses["value"], GREEN, "Value")
     if plotted:
         _use_log_scale(axis, [losses["policy"], losses["value"]])
         axis.legend(fontsize=9)
