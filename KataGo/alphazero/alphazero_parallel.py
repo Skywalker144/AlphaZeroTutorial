@@ -8,9 +8,12 @@ from .utils import (
     add_dirichlet_noise,
     apply_temperature,
     chosen_move_temperature,
+    policy_surprise,
+    redistribute_surprise_weights,
     reduced_search_limit,
     root_policy_temperature,
     search_visit_counts,
+    value_surprise,
     value_target,
 )
 
@@ -40,6 +43,8 @@ class _Node:
         "wdl_sum",
         "visits",
         "legal_actions_mask",
+        "prior_policy",
+        "nn_wdl",
     )
 
     def __init__(self, state, to_play, prior=0.0, parent=None, action_taken=None):
@@ -52,6 +57,8 @@ class _Node:
         self.wdl_sum = np.zeros(3)
         self.visits = 0
         self.legal_actions_mask = None
+        self.prior_policy = None
+        self.nn_wdl = None
 
 
 def _materialize(node, game):
@@ -285,6 +292,8 @@ class _GameSession:
                 "to_play": self.to_play,
                 "mcts_policy": mcts_policy,
                 "weight": self.target_weight,
+                "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
+                "value_surprise": value_surprise(root.wdl_sum / root.visits, root.nn_wdl),
             })
 
         temperature = chosen_move_temperature(
@@ -304,6 +313,11 @@ class _GameSession:
             winner = game.get_winner(self.state, self.to_play)
             encode_state = game.encode_state
             memory = self.memory
+            redistribute_surprise_weights(
+                memory,
+                self.args.get("policy_surprise_data_weight", 0.5),
+                self.args.get("value_surprise_data_weight", 0.1),
+            )
             samples = [
                 {
                     "encoded_state": encode_state(sample["state"], sample["to_play"]),
@@ -395,6 +409,9 @@ class _GameSession:
                 board_size=self.game.board_size,
                 noise_weight=self.dirichlet_noise_weight,
             )
+        if node is search.root:
+            node.prior_policy = policy
+            node.nn_wdl = value
         _expand(node, policy, self.game, legal_actions_mask)
         _backpropagate(node, value)
         search.pending = None

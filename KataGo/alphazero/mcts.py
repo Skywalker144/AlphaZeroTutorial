@@ -22,6 +22,8 @@ class Node:
         self.children = []
         self.wdl_sum = np.zeros(3)
         self.visits = 0
+        self.prior_policy = None
+        self.nn_wdl = None
 
     def update(self, wdl):
         self.wdl_sum += wdl
@@ -133,6 +135,8 @@ class MCTS:
                     noise_weight=self.args.get("dirichlet_noise_weight", 0.25),
                 )
 
+            root.prior_policy = policy
+            root.nn_wdl = value
             self.expand(root, policy)
             self.backpropagate(root, value)
             remaining = num_simulations

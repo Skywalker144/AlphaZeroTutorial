@@ -17,9 +17,12 @@ from .utils import (
     apply_temperature,
     auto_device,
     chosen_move_temperature,
+    policy_surprise,
     random_augment_batch,
+    redistribute_surprise_weights,
     reduced_search_limit,
     search_visit_counts,
+    value_surprise,
     value_target,
 )
 
@@ -241,6 +244,8 @@ class AlphaZero:
                     "to_play": to_play,
                     "mcts_policy": mcts_policy,
                     "weight": weight,
+                    "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
+                    "value_surprise": value_surprise(root.wdl_sum / root.visits, root.nn_wdl),
                 })
 
             temperature = chosen_move_temperature(
@@ -257,6 +262,11 @@ class AlphaZero:
             turn_number += 1
 
         winner = self.game.get_winner(state, to_play)
+        redistribute_surprise_weights(
+            memory,
+            self.args.get("policy_surprise_data_weight", 0.5),
+            self.args.get("value_surprise_data_weight", 0.1),
+        )
         samples = [
             {
                 "encoded_state": self.game.encode_state(sample["state"], sample["to_play"]),

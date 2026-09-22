@@ -103,6 +103,53 @@ def reduced_search_limit(args, win_loss_history, full_visits, cheap_visits):
     return visits, 1.0 + prop * (weight - 1.0)
 
 
+def policy_surprise(prior_policy, mcts_policy):
+    support = mcts_policy > 0
+    prior = np.maximum(prior_policy[support], 1e-100)
+    target = mcts_policy[support]
+    surprise = np.sum(target * (np.log(target) - np.log(prior)))
+    return max(0.0, float(surprise))
+
+
+def value_surprise(search_wdl, nn_wdl):
+    search = np.maximum(search_wdl, 0.0)
+    total = search.sum()
+    if total <= 0.0:
+        return 0.0
+    search = search / total
+    surprise = np.sum(
+        search * (np.log(np.maximum(search, 1e-100)) - np.log(np.maximum(nn_wdl, 1e-100)))
+    )
+    return min(max(0.0, float(surprise)), 1.0)
+
+
+def redistribute_surprise_weights(samples, policy_data_weight, value_data_weight):
+    sum_weights = sum(sample["weight"] for sample in samples)
+    if sum_weights < 1.0:
+        return
+    sum_policy = sum(sample["policy_surprise"] * sample["weight"] for sample in samples)
+    sum_value = sum(sample["value_surprise"] * sample["weight"] for sample in samples)
+    average_policy = sum_policy / sum_weights
+    average_value = sum_value / sum_weights
+    if average_value < 0.010:
+        value_data_weight *= average_value / 0.010
+    threshold = average_policy * 1.5
+    policy_props = [
+        sample["weight"] * sample["policy_surprise"]
+        + (1.0 - sample["weight"]) * max(0.0, sample["policy_surprise"] - threshold)
+        for sample in samples
+    ]
+    value_props = [sample["weight"] * sample["value_surprise"] for sample in samples]
+    sum_policy_prop = max(sum(policy_props), 1e-10)
+    sum_value_prop = max(sum(value_props), 1e-10)
+    for i, sample in enumerate(samples):
+        sample["weight"] = (
+            (1.0 - policy_data_weight - value_data_weight) * sample["weight"]
+            + policy_data_weight * policy_props[i] * sum_weights / sum_policy_prop
+            + value_data_weight * value_props[i] * sum_weights / sum_value_prop
+        )
+
+
 def apply_temperature(probs, temperature):
     if temperature <= 1e-4:
         result = np.zeros_like(probs)
