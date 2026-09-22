@@ -70,8 +70,17 @@ def _materialize(node, game):
 # -- 与 MCTS 等价的树操作（自由函数版，供多棵树复用） ----------------------
 
 
-def _select(node, c_puct):
+def _select(node, c_puct, reduction_max):
     """选择 PUCT 值最大的子节点（与 MCTS.select 一致）。"""
+    policy_mass_visited = 0.0
+    for child in node.children:
+        if child.visits > 0:
+            policy_mass_visited += child.prior
+    if node.visits:
+        parent_value = (node.wdl_sum[0] - node.wdl_sum[2]) / node.visits
+    else:
+        parent_value = 0.0
+    fpu_value = parent_value - reduction_max * math.sqrt(policy_mass_visited)
     sqrt_visits = math.sqrt(node.visits)
     best_score = -float("inf")
     best_child = None
@@ -80,10 +89,10 @@ def _select(node, c_puct):
     for child in node.children:
         visits = child.visits
         if visits:
-            q = (child.wdl_sum[0] - child.wdl_sum[2]) / visits
+            value = -(child.wdl_sum[0] - child.wdl_sum[2]) / visits
         else:
-            q = 0
-        score = -q + c_puct * child.prior * sqrt_visits / (1 + visits)
+            value = fpu_value
+        score = value + c_puct * child.prior * sqrt_visits / (1 + visits)
         if score > best_score:
             best_score = score
             best_child = child
@@ -183,6 +192,8 @@ class _GameSession:
         "args",
         "action_size",
         "c_puct",
+        "fpu_reduction_max",
+        "root_fpu_reduction_max",
         "num_simulations",
         "cheap_search_prob",
         "cheap_search_visits",
@@ -204,6 +215,8 @@ class _GameSession:
         # 每局固定不变的超参数在构造时解析一次，避免每次模拟都查 args。
         self.action_size = game.board_size ** 2
         self.c_puct = args.get("c_puct", 1.5)
+        self.fpu_reduction_max = args.get("fpu_reduction_max", 0.2)
+        self.root_fpu_reduction_max = args.get("root_fpu_reduction_max", 0.0)
         self.num_simulations, self.cheap_search_visits = search_visit_counts(
             args, game.board_size
         )
@@ -321,8 +334,10 @@ class _GameSession:
             game = self.game
             c_puct = self.c_puct
             node = search.root
+            reduction_max = self.fpu_reduction_max if self.is_cheap else self.root_fpu_reduction_max
             while node.children:
-                node = _select(node, c_puct)
+                node = _select(node, c_puct, reduction_max)
+                reduction_max = self.fpu_reduction_max
 
             # 一次模拟 = 走到一个叶子；终局叶子直接回传，非终局叶子挂起等
             # 批量评估（评估由 deliver 完成），两种情况都计一次模拟。

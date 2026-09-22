@@ -52,13 +52,26 @@ class MCTS:
         policy_logits = self.game.mask_illegal_actions(state, to_play, policy_logits)
         return softmax(policy_logits), value_probs
 
-    def select(self, node):
+    def select(self, node, is_root, cheap):
         # 选择 PUCT值 最大的节点
         c_puct = self.args.get("c_puct", 1.5)
+        if cheap or not is_root:
+            reduction_max = self.args.get("fpu_reduction_max", 0.2)
+        else:
+            reduction_max = self.args.get("root_fpu_reduction_max", 0.0)
+        policy_mass_visited = 0.0
+        for child in node.children:
+            if child.visits > 0:
+                policy_mass_visited += child.prior
+        fpu_value = node.q_value() - reduction_max * math.sqrt(policy_mass_visited)
         best_score = -float("inf")
         best_child = None
         for child in node.children:
-            score = -child.q_value() + c_puct * child.prior * math.sqrt(node.visits) / (1 + child.visits)
+            if child.visits == 0:
+                value = fpu_value
+            else:
+                value = -child.q_value()
+            score = value + c_puct * child.prior * math.sqrt(node.visits) / (1 + child.visits)
             if score > best_score:
                 best_score = score
                 best_child = child
@@ -128,7 +141,7 @@ class MCTS:
         for _ in range(remaining):
             node = root
             while node.children:
-                node = self.select(node)
+                node = self.select(node, node is root, cheap)
 
             if self.game.is_terminal(node.state, node.to_play):
                 value = value_target(self.game.get_winner(node.state, node.to_play), node.to_play)
