@@ -8,6 +8,7 @@ from .utils import (
     apply_temperature,
     root_policy_temperature,
     softmax,
+    value_target,
 )
 
 
@@ -19,17 +20,17 @@ class Node:
         self.parent = parent
         self.action_taken = action_taken
         self.children = []
-        self.value_sum = 0.0
+        self.wdl_sum = np.zeros(3)
         self.visits = 0
 
-    def update(self, value):
-        self.value_sum += value
+    def update(self, wdl):
+        self.wdl_sum += wdl
         self.visits += 1
 
     def q_value(self):
         if self.visits == 0:
-            return 0
-        return self.value_sum / self.visits
+            return 0.0
+        return float((self.wdl_sum[0] - self.wdl_sum[2]) / self.visits)
 
 
 class MCTS:
@@ -44,11 +45,12 @@ class MCTS:
         # state, to_play -> encoded_state ---NeuralNetwork---> policy, value
         encoded = self.game.encode_state(state, to_play)
         tensor = torch.tensor(encoded, dtype=torch.float32, device=self.device).unsqueeze(0)
-        policy_logits, value = self.model(tensor)
+        policy_logits, value_logits = self.model(tensor)
         policy_logits = policy_logits.flatten().cpu().numpy()
+        value_probs = softmax(value_logits.flatten().float().cpu().numpy())
 
         policy_logits = self.game.mask_illegal_actions(state, to_play, policy_logits)
-        return softmax(policy_logits), float(value.item())
+        return softmax(policy_logits), value_probs
 
     def select(self, node):
         # 选择 PUCT值 最大的节点
@@ -77,11 +79,11 @@ class MCTS:
                 )
             )
 
-    def backpropagate(self, node, value):
+    def backpropagate(self, node, wdl):
         # 沿路径回传 Value 并更新统计信息
         while node is not None:
-            node.update(value)
-            value = -value
+            node.update(wdl)
+            wdl = wdl[::-1]
             node = node.parent
 
     def advance(self, root, action):
@@ -101,7 +103,7 @@ class MCTS:
             policy, value = self.nn_inference(state, to_play)
 
             if self.args.get("mode", "train") == "eval" and num_simulations == 0:
-                return policy, value, None
+                return policy, float(value[0] - value[2]), None
 
             root = Node(state, to_play)
 
@@ -129,7 +131,7 @@ class MCTS:
                 node = self.select(node)
 
             if self.game.is_terminal(node.state, node.to_play):
-                value = self.game.get_winner(node.state, node.to_play) * node.to_play
+                value = value_target(self.game.get_winner(node.state, node.to_play), node.to_play)
             else:
                 policy, value = self.nn_inference(node.state, node.to_play)
                 self.expand(node, policy)

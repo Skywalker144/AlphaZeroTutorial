@@ -19,6 +19,7 @@ from .utils import (
     chosen_move_temperature,
     random_augment_batch,
     search_visit_counts,
+    value_target,
 )
 
 
@@ -249,7 +250,7 @@ class AlphaZero:
             {
                 "encoded_state": self.game.encode_state(sample["state"], sample["to_play"]),
                 "policy_target": sample["mcts_policy"],
-                "value_target": float(winner) * sample["to_play"],
+                "value_target": value_target(winner, sample["to_play"]),
             }
             for sample in memory
         ]
@@ -273,11 +274,11 @@ class AlphaZero:
 
         self.model.train()
         self.optimizer.zero_grad()
-        policy_logits, value = self.model(states)
+        policy_logits, value_logits = self.model(states)
 
         policy_loss = -torch.mean(torch.sum(policy_targets * F.log_softmax(policy_logits, dim=1), dim=1))
-        value_loss = F.mse_loss(value.squeeze(1), value_targets)
-        total_loss = policy_loss + value_loss
+        value_loss = -torch.mean(torch.sum(value_targets * F.log_softmax(value_logits, dim=1), dim=1))
+        total_loss = policy_loss + self.args.get("value_loss_scale", 1.2) * value_loss
 
         total_loss.backward()
         self.optimizer.step()

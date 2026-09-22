@@ -45,8 +45,8 @@ class TestSelfplay:
             assert sample["encoded_state"].shape == (3, 3, 3)
             assert sample["policy_target"].shape == (9,)
             assert np.isclose(sample["policy_target"].sum(), 1.0)
-            assert np.isscalar(sample["value_target"])
-            assert sample["value_target"] in (-1.0, 0.0, 1.0)
+            assert sample["value_target"].shape == (3,)
+            assert np.isclose(sample["value_target"].sum(), 1.0)
 
     def test_training_returns_shared_model_to_eval_mode(self, tiny_args):
         args = {**tiny_args, "batch_size": 1, "min_rows": 1}
@@ -83,7 +83,9 @@ class TestValueTargets:
         game_data, winner, _ = az.selfplay()
         for sample in game_data:
             to_play = 1 if sample["encoded_state"][2].all() else -1
-            assert sample["value_target"] == float(winner) * to_play
+            outcome = winner * to_play
+            expected = np.array([outcome > 0, outcome == 0, outcome < 0], dtype=np.float32)
+            assert np.array_equal(sample["value_target"], expected)
 
 
 class TestCheckpoint:

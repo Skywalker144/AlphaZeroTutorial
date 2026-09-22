@@ -46,6 +46,18 @@ def chosen_move_temperature(args, turn_number, board_size):
     )
 
 
+def value_target(winner, to_play):
+    outcome = winner * to_play
+    target = np.zeros(3, dtype=np.float32)
+    if outcome > 0:
+        target[0] = 1.0
+    elif outcome < 0:
+        target[2] = 1.0
+    else:
+        target[1] = 1.0
+    return target
+
+
 def search_visit_counts(args, board_size):
     full = max(
         args.get("full_search_visits_floor", 50),

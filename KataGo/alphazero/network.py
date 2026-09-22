@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -46,7 +45,7 @@ class ResNet(nn.Module):
             nn.Flatten(),
             nn.Linear(num_channels, num_channels // 2),
             nn.SiLU(inplace=True),
-            nn.Linear(num_channels // 2, 1),
+            nn.Linear(num_channels // 2, 3),
         )
 
     def forward(self, x):
@@ -54,5 +53,5 @@ class ResNet(nn.Module):
         for block in self.trunk:
             x = block(x)
         policy_logits = self.policy_head(x).flatten(1)
-        value = torch.tanh(self.value_head(x))
-        return policy_logits, value
+        value_logits = self.value_head(x)
+        return policy_logits, value_logits

@@ -37,9 +37,12 @@ def assert_valid_game(samples, winner, game_len, game):
         assert sample["encoded_state"].shape == (game.num_planes, game.board_size, game.board_size)
         assert sample["policy_target"].shape == (game.board_size ** 2,)
         assert np.isclose(sample["policy_target"].sum(), 1.0)
-        assert sample["value_target"] in (-1.0, 0.0, 1.0)
+        assert sample["value_target"].shape == (3,)
+        assert np.isclose(sample["value_target"].sum(), 1.0)
         to_play = 1 if sample["encoded_state"][2].all() else -1
-        assert sample["value_target"] == float(winner) * to_play
+        outcome = winner * to_play
+        expected = np.array([outcome > 0, outcome == 0, outcome < 0], dtype=np.float32)
+        assert np.array_equal(sample["value_target"], expected)
 
 
 class TestBatchedInference:
@@ -64,7 +67,7 @@ class TestBatchedInference:
         for node, (policy, value) in zip(nodes, batch):
             seq_policy, seq_value = mcts.nn_inference(node.state, node.to_play)
             assert np.allclose(policy, seq_policy, atol=1e-5)
-            assert abs(value - seq_value) < 1e-5
+            assert np.allclose(value, seq_value, atol=1e-5)
 
 
 class TestGames:
@@ -125,7 +128,7 @@ class TestGames:
             for a, b in zip(s1, s2):
                 assert np.array_equal(a["encoded_state"], b["encoded_state"])
                 assert np.array_equal(a["policy_target"], b["policy_target"])
-                assert a["value_target"] == b["value_target"]
+                assert np.array_equal(a["value_target"], b["value_target"])
 
 
 class TestEquivalence:
@@ -155,7 +158,7 @@ class TestEquivalence:
         for a, b in zip(seq_samples, par_samples):
             assert np.array_equal(a["encoded_state"], b["encoded_state"])
             assert np.array_equal(a["policy_target"], b["policy_target"])
-            assert a["value_target"] == b["value_target"]
+            assert np.array_equal(a["value_target"], b["value_target"])
 
 
 class TestTrainerIntegration:

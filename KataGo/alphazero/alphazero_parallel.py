@@ -10,6 +10,7 @@ from .utils import (
     chosen_move_temperature,
     root_policy_temperature,
     search_visit_counts,
+    value_target,
 )
 
 
@@ -35,7 +36,7 @@ class _Node:
         "parent",
         "action_taken",
         "children",
-        "value_sum",
+        "wdl_sum",
         "visits",
         "legal_actions_mask",
     )
@@ -47,7 +48,7 @@ class _Node:
         self.parent = parent
         self.action_taken = action_taken
         self.children = []
-        self.value_sum = 0.0
+        self.wdl_sum = np.zeros(3)
         self.visits = 0
         self.legal_actions_mask = None
 
@@ -79,7 +80,7 @@ def _select(node, c_puct):
     for child in node.children:
         visits = child.visits
         if visits:
-            q = child.value_sum / visits
+            q = (child.wdl_sum[0] - child.wdl_sum[2]) / visits
         else:
             q = 0
         score = -q + c_puct * child.prior * sqrt_visits / (1 + visits)
@@ -104,12 +105,12 @@ def _expand(node, policy, game, legal_actions_mask=None):
         children.append(_Node(None, next_to_play, policy[action], node, action))
 
 
-def _backpropagate(node, value):
+def _backpropagate(node, wdl):
     """沿路径回传 value 并翻转视角（与 MCTS.backpropagate 一致）。"""
     while node is not None:
-        node.value_sum += value
+        node.wdl_sum += wdl
         node.visits += 1
-        value = -value
+        wdl = wdl[::-1]
         node = node.parent
 
 
@@ -280,7 +281,7 @@ class _GameSession:
                 {
                     "encoded_state": encode_state(sample["state"], sample["to_play"]),
                     "policy_target": sample["mcts_policy"],
-                    "value_target": float(winner) * sample["to_play"],
+                    "value_target": value_target(winner, sample["to_play"]),
                 }
                 for sample in memory
             ]
@@ -329,7 +330,7 @@ class _GameSession:
             # 选中叶子时才真正算出它的棋局状态（惰性展开）。
             state = _materialize(node, game)
             if game.is_terminal(state, node.to_play):
-                value = game.get_winner(state, node.to_play) * node.to_play
+                value = value_target(game.get_winner(state, node.to_play), node.to_play)
                 _backpropagate(node, value)
                 continue
 
@@ -427,7 +428,7 @@ class ParallelSelfPlayer:
             masks[i] = mask
             node.legal_actions_mask = mask  # 供 deliver/_expand 复用
 
-        policy_logits, values = self.model(torch.from_numpy(encoded).to(self.device))
+        policy_logits, value_logits = self.model(torch.from_numpy(encoded).to(self.device))
 
         # 一次性完成 mask + softmax，逐行结果与 utils.softmax 逐位一致。
         logits = policy_logits.reshape(n, -1).float().cpu().numpy().astype(np.float64)
@@ -436,8 +437,11 @@ class ParallelSelfPlayer:
         np.exp(logits, out=logits)
         logits /= logits.sum(axis=1, keepdims=True)
 
-        values = values.reshape(-1).float().cpu().numpy()
-        return [(logits[i], float(values[i])) for i in range(n)]
+        value_probs = value_logits.reshape(n, -1).float().cpu().numpy().astype(np.float64)
+        value_probs -= value_probs.max(axis=1, keepdims=True)
+        np.exp(value_probs, out=value_probs)
+        value_probs /= value_probs.sum(axis=1, keepdims=True)
+        return [(logits[i], value_probs[i]) for i in range(n)]
 
     def run(self, total_games):
         """收集 ``total_games`` 局，按完成顺序 yield (samples, winner, game_len)。"""

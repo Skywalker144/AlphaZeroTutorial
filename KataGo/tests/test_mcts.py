@@ -12,6 +12,7 @@ from alphazero.utils import (
     root_policy_temperature,
     search_visit_counts,
     softmax,
+    value_target,
 )
 from envs.gomoku import Gomoku
 
@@ -149,6 +150,14 @@ class TestCheapSearch:
         assert calls == {"temperature": 0, "noise": 0}
         mcts.search(state, 1, 5, 0, False)
         assert calls == {"temperature": 1, "noise": 1}
+
+
+class TestValueTarget:
+    def test_win_draw_loss_encoding(self):
+        assert np.array_equal(value_target(1, 1), np.array([1, 0, 0], dtype=np.float32))
+        assert np.array_equal(value_target(0, 1), np.array([0, 1, 0], dtype=np.float32))
+        assert np.array_equal(value_target(-1, 1), np.array([0, 0, 1], dtype=np.float32))
+        assert np.array_equal(value_target(-1, -1), np.array([1, 0, 0], dtype=np.float32))
 
 
 class TestVisitFloors:
