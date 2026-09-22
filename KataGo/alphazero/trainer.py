@@ -18,6 +18,7 @@ from .utils import (
     auto_device,
     chosen_move_temperature,
     random_augment_batch,
+    reduced_search_limit,
     search_visit_counts,
     value_target,
 )
@@ -213,23 +214,33 @@ class AlphaZero:
             self.args, self.game.board_size
         )
         cheap_search_prob = self.args.get("cheap_search_prob", 0.75)
+        win_loss_history = []
         root = None
         while not self.game.is_terminal(state, to_play):
 
             cheap = np.random.random() < cheap_search_prob
-            mcts_policy, _, root = self.mcts.search(
+            if cheap:
+                num_simulations = cheap_simulations
+                weight = 1.0
+            else:
+                num_simulations, weight = reduced_search_limit(
+                    self.args, win_loss_history, full_simulations, cheap_simulations
+                )
+            mcts_policy, root_value, root = self.mcts.search(
                 state, to_play,
-                num_simulations=cheap_simulations if cheap else full_simulations,
+                num_simulations=num_simulations,
                 turn_number=turn_number,
                 cheap=cheap,
                 root=root if cheap else None,
             )
+            win_loss_history.append(root_value * to_play)
 
             if not cheap:
                 memory.append({
                     "state": state,
                     "to_play": to_play,
                     "mcts_policy": mcts_policy,
+                    "weight": weight,
                 })
 
             temperature = chosen_move_temperature(
@@ -251,6 +262,7 @@ class AlphaZero:
                 "encoded_state": self.game.encode_state(sample["state"], sample["to_play"]),
                 "policy_target": sample["mcts_policy"],
                 "value_target": value_target(winner, sample["to_play"]),
+                "weight": sample["weight"],
             }
             for sample in memory
         ]
@@ -271,13 +283,19 @@ class AlphaZero:
         value_targets = torch.tensor(
             np.array([s["value_target"] for s in batch]), dtype=torch.float32, device=self.device
         )
+        weights = torch.tensor(
+            np.array([s["weight"] for s in batch]), dtype=torch.float32, device=self.device
+        )
 
         self.model.train()
         self.optimizer.zero_grad()
         policy_logits, value_logits = self.model(states)
 
-        policy_loss = -torch.mean(torch.sum(policy_targets * F.log_softmax(policy_logits, dim=1), dim=1))
-        value_loss = -torch.mean(torch.sum(value_targets * F.log_softmax(value_logits, dim=1), dim=1))
+        policy_losses = -torch.sum(policy_targets * F.log_softmax(policy_logits, dim=1), dim=1)
+        value_losses = -torch.sum(value_targets * F.log_softmax(value_logits, dim=1), dim=1)
+        weight_sum = weights.sum()
+        policy_loss = torch.sum(weights * policy_losses) / weight_sum
+        value_loss = torch.sum(weights * value_losses) / weight_sum
         total_loss = policy_loss + self.args.get("value_loss_scale", 1.2) * value_loss
 
         total_loss.backward()

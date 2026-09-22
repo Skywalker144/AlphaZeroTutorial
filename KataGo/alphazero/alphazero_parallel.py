@@ -8,6 +8,7 @@ from .utils import (
     add_dirichlet_noise,
     apply_temperature,
     chosen_move_temperature,
+    reduced_search_limit,
     root_policy_temperature,
     search_visit_counts,
     value_target,
@@ -200,6 +201,8 @@ class _GameSession:
         "is_cheap",
         "carried_root",
         "turn_number",
+        "win_loss_history",
+        "target_weight",
         "dirichlet_concentration",
         "dirichlet_noise_weight",
         "state",
@@ -224,6 +227,8 @@ class _GameSession:
         self.is_cheap = False
         self.carried_root = None
         self.turn_number = 0
+        self.win_loss_history = []
+        self.target_weight = 1.0
         self.dirichlet_concentration = args.get(
             "dirichlet_total_concentration", 0.03 * game.board_size ** 2
         )
@@ -243,14 +248,19 @@ class _GameSession:
             root = self.carried_root
             self.carried_root = None
             num_simulations = max(0, self.cheap_search_visits + 1 - root.visits)
+            self.target_weight = 1.0
         else:
             if self.carried_root is not None:
                 _discard_tree(self.carried_root)
                 self.carried_root = None
             root = _Node(self.state, self.to_play)
-            num_simulations = (
-                self.cheap_search_visits if self.is_cheap else self.num_simulations
-            )
+            if self.is_cheap:
+                num_simulations = self.cheap_search_visits
+                self.target_weight = 1.0
+            else:
+                num_simulations, self.target_weight = reduced_search_limit(
+                    self.args, self.win_loss_history, self.num_simulations, self.cheap_search_visits
+                )
         search = _Search(root, num_simulations)
         if not root.children:
             search.pending = root  # 根节点评估最先入队
@@ -261,16 +271,20 @@ class _GameSession:
         """搜索结束：记录样本、按温度选动作落子、判断终局。"""
         search = self.search
         game = self.game
+        root = search.root
         mcts_policy = np.zeros(self.action_size)
-        for child in search.root.children:
+        for child in root.children:
             mcts_policy[child.action_taken] = child.visits
         mcts_policy /= np.sum(mcts_policy)
+        win_loss = (root.wdl_sum[0] - root.wdl_sum[2]) / root.visits
+        self.win_loss_history.append(win_loss * self.to_play)
 
         if not self.is_cheap:
             self.memory.append({
                 "state": self.state,
                 "to_play": self.to_play,
                 "mcts_policy": mcts_policy,
+                "weight": self.target_weight,
             })
 
         temperature = chosen_move_temperature(
@@ -295,6 +309,7 @@ class _GameSession:
                     "encoded_state": encode_state(sample["state"], sample["to_play"]),
                     "policy_target": sample["mcts_policy"],
                     "value_target": value_target(winner, sample["to_play"]),
+                    "weight": sample["weight"],
                 }
                 for sample in memory
             ]

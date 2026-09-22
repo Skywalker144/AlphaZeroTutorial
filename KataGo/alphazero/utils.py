@@ -73,6 +73,36 @@ def search_visit_counts(args, board_size):
     return full, cheap
 
 
+def reduced_search_limit(args, win_loss_history, full_visits, cheap_visits):
+    """
+    soft resignation：局势已经一边倒时，给终局前的搜索降低访问数、降低样本权重，而不是直接认输。
+
+    - 取最近 reduce_visits_threshold_lookback 步的 WinLoss（绝对视角），算
+      extreme = max(min, -max) 并 clamp 到 1；
+    - 若 extreme 超过 reduce_visits_threshold，则按 (extreme - threshold)/(1 - threshold) 的平方
+      在 full_visits 与 reduced_visits_min 之间插值，并把样本权重从 1 向 reduced_visits_weight 插值。
+    """
+    if not args.get("reduce_visits", True):
+        return full_visits, 1.0
+    lookback = args.get("reduce_visits_threshold_lookback", 3)
+    if len(win_loss_history) < lookback:
+        return full_visits, 1.0
+    threshold = args.get("reduce_visits_threshold", 0.9)
+    recent = win_loss_history[-lookback:]
+    extreme = max(min(recent), -max(recent))
+    if extreme > 1.0:
+        extreme = 1.0
+    amount = extreme - threshold
+    if amount <= 0.0:
+        return full_visits, 1.0
+    prop = (amount / (1.0 - threshold)) ** 2
+    min_visits = args.get("reduced_visits_min", cheap_visits)
+    weight = args.get("reduced_visits_weight", 0.1)
+    visits = round(full_visits + prop * (min_visits - full_visits))
+    visits = max(visits, min_visits)
+    return visits, 1.0 + prop * (weight - 1.0)
+
+
 def apply_temperature(probs, temperature):
     if temperature <= 1e-4:
         result = np.zeros_like(probs)
