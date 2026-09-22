@@ -46,6 +46,21 @@ def chosen_move_temperature(args, turn_number, board_size):
     )
 
 
+def search_visit_counts(args, board_size):
+    full = max(
+        args.get("full_search_visits_floor", 50),
+        round(args.get("num_simulations", 1.66 * board_size ** 2)),
+    )
+    cheap = min(
+        full,
+        max(
+            args.get("cheap_search_visits_floor", 20),
+            round(args.get("cheap_search_visits", 0.28 * board_size ** 2)),
+        ),
+    )
+    return full, cheap
+
+
 def apply_temperature(probs, temperature):
     if temperature <= 1e-4:
         result = np.zeros_like(probs)

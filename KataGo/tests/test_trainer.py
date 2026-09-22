@@ -19,6 +19,8 @@ def tiny_args(tmp_path):
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
         "dirichlet_noise_weight": 0.25,
         "cheap_search_prob": 0.0,
+        "cheap_search_visits_floor": 0,
+        "full_search_visits_floor": 0,
         "num_iterations": 2,
         "train_steps": 2,
         "batch_size": 16,

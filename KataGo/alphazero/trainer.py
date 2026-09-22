@@ -18,6 +18,7 @@ from .utils import (
     auto_device,
     chosen_move_temperature,
     random_augment_batch,
+    search_visit_counts,
 )
 
 
@@ -207,22 +208,20 @@ class AlphaZero:
         state = self.game.get_initial_state()
         to_play = 1
         turn_number = 0
-        full_simulations = round(
-            self.args.get("num_simulations", 1.66 * self.game.board_size ** 2)
-        )
-        cheap_simulations = min(
-            full_simulations,
-            round(self.args.get("cheap_search_visits", 0.28 * self.game.board_size ** 2)),
+        full_simulations, cheap_simulations = search_visit_counts(
+            self.args, self.game.board_size
         )
         cheap_search_prob = self.args.get("cheap_search_prob", 0.75)
+        root = None
         while not self.game.is_terminal(state, to_play):
 
             cheap = np.random.random() < cheap_search_prob
-            mcts_policy, _ = self.mcts.search(
+            mcts_policy, _, root = self.mcts.search(
                 state, to_play,
                 num_simulations=cheap_simulations if cheap else full_simulations,
                 turn_number=turn_number,
                 cheap=cheap,
+                root=root if cheap else None,
             )
 
             if not cheap:
@@ -238,6 +237,8 @@ class AlphaZero:
             action = np.random.choice(
                 len(mcts_policy), p=apply_temperature(mcts_policy, temperature)
             )
+
+            root = self.mcts.advance(root, action)
 
             state = self.game.get_next_state(state, action, to_play)
             to_play = -to_play

@@ -16,6 +16,8 @@ def make_args(**overrides):
         "num_channels": 8,
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
         "cheap_search_prob": 0.0,
+        "cheap_search_visits_floor": 0,
+        "full_search_visits_floor": 0,
         "num_parallel_games": 4,
     }
     args.update(overrides)
@@ -137,6 +139,8 @@ class TestEquivalence:
             "num_blocks": 1,
             "num_channels": 8,
             "dirichlet_total_concentration": 0.03 * 3 ** 2,
+            "cheap_search_visits_floor": 0,
+            "full_search_visits_floor": 0,
         }
         seq = AlphaZero(game, {**base_args, "parallel": False})
         par = AlphaZero(game, {**base_args, "parallel": True, "num_parallel_games": 1})
@@ -164,6 +168,8 @@ class TestTrainerIntegration:
             "num_channels": 8,
             "dirichlet_total_concentration": 0.03 * 3 ** 2,
             "cheap_search_prob": 0.0,
+            "cheap_search_visits_floor": 0,
+            "full_search_visits_floor": 0,
             "parallel": True,
             "num_parallel_games": 3,
             "num_iterations": 1,

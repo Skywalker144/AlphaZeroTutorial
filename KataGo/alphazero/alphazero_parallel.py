@@ -9,6 +9,7 @@ from .utils import (
     apply_temperature,
     chosen_move_temperature,
     root_policy_temperature,
+    search_visit_counts,
 )
 
 
@@ -126,6 +127,25 @@ def _discard_tree(root):
         node.parent = None
 
 
+def _advance(root, action, game):
+    children = root.children
+    promoted = None
+    for i, child in enumerate(children):
+        if child.action_taken == action:
+            promoted = child
+            del children[i]
+            break
+    if promoted is None:
+        _discard_tree(root)
+        return None
+    _materialize(promoted, game)
+    promoted.parent = None
+    root.children = []
+    for child in children:
+        _discard_tree(child)
+    return promoted
+
+
 # -- 单局的搜索 / 对局状态机 ------------------------------------------------
 
 
@@ -139,8 +159,8 @@ class _Search:
 
     __slots__ = ("root", "num_simulations", "simulations", "pending")
 
-    def __init__(self, state, to_play, num_simulations):
-        self.root = _Node(state, to_play)
+    def __init__(self, root, num_simulations):
+        self.root = root
         self.num_simulations = num_simulations
         self.simulations = 0
         self.pending = None  # 等待 NN 评估的节点（根节点评估也走这里）
@@ -166,6 +186,7 @@ class _GameSession:
         "cheap_search_prob",
         "cheap_search_visits",
         "is_cheap",
+        "carried_root",
         "turn_number",
         "dirichlet_concentration",
         "dirichlet_noise_weight",
@@ -182,15 +203,12 @@ class _GameSession:
         # 每局固定不变的超参数在构造时解析一次，避免每次模拟都查 args。
         self.action_size = game.board_size ** 2
         self.c_puct = args.get("c_puct", 1.5)
-        self.num_simulations = round(
-            args.get("num_simulations", 1.7 * game.board_size ** 2)
+        self.num_simulations, self.cheap_search_visits = search_visit_counts(
+            args, game.board_size
         )
         self.cheap_search_prob = args.get("cheap_search_prob", 0.75)
-        self.cheap_search_visits = min(
-            self.num_simulations,
-            round(args.get("cheap_search_visits", 0.3 * game.board_size ** 2)),
-        )
         self.is_cheap = False
+        self.carried_root = None
         self.turn_number = 0
         self.dirichlet_concentration = args.get(
             "dirichlet_total_concentration", 0.03 * game.board_size ** 2
@@ -207,13 +225,23 @@ class _GameSession:
 
     def _start_search(self):
         self.is_cheap = np.random.random() < self.cheap_search_prob
-        num_simulations = (
-            self.cheap_search_visits if self.is_cheap else self.num_simulations
-        )
-        search = _Search(self.state, self.to_play, num_simulations)
-        search.pending = search.root  # 根节点评估最先入队
+        if self.is_cheap and self.carried_root is not None:
+            root = self.carried_root
+            self.carried_root = None
+            num_simulations = max(0, self.cheap_search_visits + 1 - root.visits)
+        else:
+            if self.carried_root is not None:
+                _discard_tree(self.carried_root)
+                self.carried_root = None
+            root = _Node(self.state, self.to_play)
+            num_simulations = (
+                self.cheap_search_visits if self.is_cheap else self.num_simulations
+            )
+        search = _Search(root, num_simulations)
+        if not root.children:
+            search.pending = root  # 根节点评估最先入队
         self.search = search
-        return search.root
+        return root
 
     def _finish_move(self):
         """搜索结束：记录样本、按温度选动作落子、判断终局。"""
@@ -238,15 +266,13 @@ class _GameSession:
             self.action_size, p=apply_temperature(mcts_policy, temperature)
         )
 
-        # 本步的搜索树已用完（样本已记录、策略已取出），主动断环立即释放。
-        _discard_tree(search.root)
-
         self.state = game.get_next_state(self.state, action, self.to_play)
         self.to_play = -self.to_play
         self.turn_number += 1
         self.search = None
 
         if game.is_terminal(self.state, self.to_play):
+            _discard_tree(search.root)
             winner = game.get_winner(self.state, self.to_play)
             encode_state = game.encode_state
             memory = self.memory
@@ -259,6 +285,9 @@ class _GameSession:
                 for sample in memory
             ]
             self.result = (samples, winner, self.turn_number)
+        else:
+            # 提升落子对应的子节点供下一步复用，其余断环立即释放。
+            self.carried_root = _advance(search.root, action, game)
 
     # -- 状态机入口 -------------------------------------------------------
 
@@ -270,7 +299,10 @@ class _GameSession:
         """
         while self.result is None:
             if self.search is None:
-                requests.append((self, self._start_search()))
+                self._start_search()
+                if self.search.pending is None:
+                    continue
+                requests.append((self, self.search.root))
                 return False
 
             search = self.search
@@ -279,7 +311,10 @@ class _GameSession:
                 self._finish_move()
                 if self.result is not None:
                     return True
-                requests.append((self, self._start_search()))
+                self._start_search()
+                if self.search.pending is None:
+                    continue
+                requests.append((self, self.search.root))
                 return False
 
             game = self.game

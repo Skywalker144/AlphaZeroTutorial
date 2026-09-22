@@ -10,6 +10,7 @@ from alphazero.utils import (
     chosen_move_temperature,
     interpolate_early,
     root_policy_temperature,
+    search_visit_counts,
     softmax,
 )
 from envs.gomoku import Gomoku
@@ -150,6 +151,62 @@ class TestCheapSearch:
         assert calls == {"temperature": 1, "noise": 1}
 
 
+class TestVisitFloors:
+    def test_floors_apply_on_small_board(self):
+        assert search_visit_counts({}, 3) == (50, 20)
+
+    def test_formula_wins_on_large_board(self):
+        assert search_visit_counts({}, 9) == (round(1.66 * 81), round(0.28 * 81))
+
+    def test_explicit_values_with_zero_floors(self):
+        args = {
+            "num_simulations": 12,
+            "cheap_search_visits": 3,
+            "full_search_visits_floor": 0,
+            "cheap_search_visits_floor": 0,
+        }
+        assert search_visit_counts(args, 3) == (12, 3)
+
+    def test_cheap_never_exceeds_full(self):
+        args = {
+            "num_simulations": 10,
+            "cheap_search_visits": 40,
+            "full_search_visits_floor": 0,
+            "cheap_search_visits_floor": 0,
+        }
+        assert search_visit_counts(args, 3) == (10, 10)
+
+
+class TestTreeReuse:
+    def test_advance_promotes_matching_child(self):
+        game, mcts = make_mcts()
+        state = game.get_initial_state()
+        policy, _, root = mcts.search(state, 1, 10, 0, False)
+        action = int(np.argmax(policy))
+        child = mcts.advance(root, action)
+        assert child is not None
+        assert child.parent is None
+        assert child.action_taken == action
+
+    def test_advance_missing_action_returns_none(self):
+        game, mcts = make_mcts()
+        state = game.get_initial_state()
+        state[0, 0] = 1
+        _, _, root = mcts.search(state, -1, 5, 0, False)
+        assert mcts.advance(root, 0) is None
+
+    def test_reuse_continues_until_target_visits(self):
+        game, mcts = make_mcts()
+        state = game.get_initial_state()
+        policy, _, root = mcts.search(state, 1, 10, 0, False)
+        action = int(np.argmax(policy))
+        reused = mcts.advance(root, action)
+        inherited = reused.visits
+        _, _, root2 = mcts.search(state, -1, 30, 1, True, root=reused)
+        assert root2 is reused
+        assert root2.visits == max(inherited, 31)
+
+
 class TestMCTS:
     def test_expand_uses_legality_instead_of_probability(self):
         game, mcts = make_mcts()
@@ -166,14 +223,14 @@ class TestMCTS:
     def test_policy_sums_to_one(self):
         game, mcts = make_mcts()
         state = game.get_initial_state()
-        policy, _ = mcts.search(state, 1, 20, 0, False)
+        policy, _, _ = mcts.search(state, 1, 20, 0, False)
         assert np.isclose(policy.sum(), 1.0)
 
     def test_policy_only_on_legal(self):
         game, mcts = make_mcts()
         state = game.get_initial_state()
         state[0, 0] = 1
-        policy, _ = mcts.search(state, -1, 20, 1, False)
+        policy, _, _ = mcts.search(state, -1, 20, 1, False)
         assert policy[0] == 0.0
 
     def test_terminal_value_correct(self):
@@ -187,7 +244,7 @@ class TestMCTS:
         # Four in a row pinned against the left edge: (4, 4) is the only win.
         state = np.zeros((9, 9), dtype=np.int8)
         state[4, 0:4] = 1
-        policy, _ = mcts.search(state, 1, 120, 4, False)
+        policy, _, _ = mcts.search(state, 1, 120, 4, False)
         assert np.argmax(policy) == 4 * 9 + 4
         assert policy[4 * 9 + 4] > 0.5
 
@@ -198,6 +255,6 @@ class TestMCTS:
         model.eval()
         args = {"c_puct": 1.5, "dirichlet_total_concentration": 0.03 * 9 ** 2, "dirichlet_noise_weight": 0.0}
         state = game.get_initial_state()
-        p1, _ = MCTS(game, args, model, "cpu").search(state, 1, 15, 0, False)
-        p2, _ = MCTS(game, args, model, "cpu").search(state, 1, 15, 0, False)
+        p1, _, _ = MCTS(game, args, model, "cpu").search(state, 1, 15, 0, False)
+        p2, _, _ = MCTS(game, args, model, "cpu").search(state, 1, 15, 0, False)
         assert np.array_equal(p1, p2)

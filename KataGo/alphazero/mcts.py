@@ -84,32 +84,46 @@ class MCTS:
             value = -value
             node = node.parent
 
+    def advance(self, root, action):
+        if root is None:
+            return None
+        for i, child in enumerate(root.children):
+            if child.action_taken == action:
+                child.parent = None
+                root.children = []
+                return child
+        return None
+
     @torch.inference_mode()
-    def search(self, state, to_play, num_simulations, turn_number, cheap):
+    def search(self, state, to_play, num_simulations, turn_number, cheap, root=None):
 
-        policy, value = self.nn_inference(state, to_play)
-        
-        if self.args.get("mode", "train") == "eval" and num_simulations == 0:
-            return policy, value
+        if root is None:
+            policy, value = self.nn_inference(state, to_play)
 
-        root = Node(state, to_play)
+            if self.args.get("mode", "train") == "eval" and num_simulations == 0:
+                return policy, value, None
 
-        if self.args.get("mode", "train") == "train" and not cheap:
-            policy = apply_temperature(
-                policy,
-                root_policy_temperature(self.args, turn_number, self.game.board_size),
-            )
-            policy = add_dirichlet_noise(
-                policy,
-                self.args.get("dirichlet_total_concentration", 0.03 * self.game.board_size ** 2),
-                legal_actions_mask=self.game.get_legal_action_mask(state, to_play),
-                noise_weight=self.args.get("dirichlet_noise_weight", 0.25),
-            )
+            root = Node(state, to_play)
 
-        self.expand(root, policy)
-        self.backpropagate(root, value)
+            if self.args.get("mode", "train") == "train" and not cheap:
+                policy = apply_temperature(
+                    policy,
+                    root_policy_temperature(self.args, turn_number, self.game.board_size),
+                )
+                policy = add_dirichlet_noise(
+                    policy,
+                    self.args.get("dirichlet_total_concentration", 0.03 * self.game.board_size ** 2),
+                    legal_actions_mask=self.game.get_legal_action_mask(state, to_play),
+                    noise_weight=self.args.get("dirichlet_noise_weight", 0.25),
+                )
 
-        for _ in range(num_simulations):
+            self.expand(root, policy)
+            self.backpropagate(root, value)
+            remaining = num_simulations
+        else:
+            remaining = max(0, num_simulations + 1 - root.visits)
+
+        for _ in range(remaining):
             node = root
             while node.children:
                 node = self.select(node)
@@ -126,4 +140,4 @@ class MCTS:
         for child in root.children:
             mcts_policy[child.action_taken] = child.visits
         mcts_policy /= np.sum(mcts_policy)
-        return mcts_policy, root.q_value()
+        return mcts_policy, root.q_value(), root

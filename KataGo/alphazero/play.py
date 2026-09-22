@@ -72,7 +72,7 @@ def play(game, train_args, side_names):
                     break
                 print("Illegal move.")
         else:
-            policy, root_value = mcts.search(state, to_play, num_simulations, turn_number, False)
+            policy, root_value, _ = mcts.search(state, to_play, num_simulations, turn_number, False)
             action = int(np.argmax(policy))
             row, col = divmod(action, game.board_size)
             print(f"AlphaZero plays: {row} {col}  root_value={root_value:+.3f}")
