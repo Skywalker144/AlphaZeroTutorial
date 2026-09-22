@@ -3,6 +3,23 @@ import pytest
 
 from envs.gomoku import Gomoku
 from envs.tictactoe import TicTacToe
+from alphazero.utils import softmax
+
+
+@pytest.mark.parametrize("game", [TicTacToe(), Gomoku()])
+def test_mask_illegal_actions_with_extreme_logits(game):
+    state = game.get_initial_state()
+    state[0, 0] = 1
+    logits = np.full(game.board_size ** 2, -1e30)
+    logits[0] = 1e30
+    original = logits.copy()
+    masked = game.mask_illegal_actions(state, -1, logits)
+    policy = softmax(masked)
+    assert np.isneginf(masked[0])
+    assert policy[0] == 0.0
+    assert np.isclose(policy.sum(), 1.0)
+    assert np.all(policy[1:] > 0)
+    assert np.array_equal(logits, original)
 
 
 def horizontal_five():
@@ -50,27 +67,27 @@ class TestGomoku:
         assert np.all(state == 0)
 
     def test_five_in_a_row_wins(self):
-        assert self.game.get_winner(horizontal_five()) == 1
-        assert self.game.is_terminal(horizontal_five())
+        assert self.game.get_winner(horizontal_five(), 1) == 1
+        assert self.game.is_terminal(horizontal_five(), 1)
 
     def test_overline_wins_freestyle(self):
-        assert self.game.get_winner(overline_six()) == 1
+        assert self.game.get_winner(overline_six(), 1) == 1
 
     def test_diagonal_five_wins(self):
-        assert self.game.get_winner(diagonal_five()) == 1
+        assert self.game.get_winner(diagonal_five(), 1) == 1
 
     def test_white_wins(self):
         state = horizontal_five()
         state[4, 1:6] = -1
-        assert self.game.get_winner(state) == -1
+        assert self.game.get_winner(state, 1) == -1
 
     def test_empty_not_terminal(self):
-        assert self.game.get_winner(self.game.get_initial_state()) is None
-        assert not self.game.is_terminal(self.game.get_initial_state())
+        assert self.game.get_winner(self.game.get_initial_state(), 1) is None
+        assert not self.game.is_terminal(self.game.get_initial_state(), 1)
 
     def test_full_board_draw(self):
-        assert self.game.get_winner(full_draw()) == 0
-        assert self.game.is_terminal(full_draw())
+        assert self.game.get_winner(full_draw(), 1) == 0
+        assert self.game.is_terminal(full_draw(), 1)
 
     def test_next_state_places_stone(self):
         state = self.game.get_initial_state()
@@ -80,10 +97,10 @@ class TestGomoku:
 
     def test_legal_actions_are_empty_cells(self):
         state = self.game.get_initial_state()
-        legal = self.game.get_is_legal_actions(state, 1)
+        legal = self.game.get_legal_action_mask(state, 1)
         assert np.sum(legal) == 81
         state[0, 0] = 1
-        legal = self.game.get_is_legal_actions(state, -1)
+        legal = self.game.get_legal_action_mask(state, -1)
         assert not legal[0]
         assert np.sum(legal) == 80
 
@@ -97,7 +114,7 @@ class TestGomoku:
     def test_nonterminal_three_in_row(self):
         state = np.zeros((9, 9), dtype=np.int8)
         state[4, 1:4] = 1
-        assert self.game.get_winner(state) is None
+        assert self.game.get_winner(state, 1) is None
 
 
 class TestTicTacToe:
@@ -108,26 +125,26 @@ class TestTicTacToe:
     def test_row_win(self):
         state = np.zeros((3, 3), dtype=np.int8)
         state[0, :] = 1
-        assert self.game.get_winner(state) == 1
+        assert self.game.get_winner(state, 1) == 1
 
     def test_col_win(self):
         state = np.zeros((3, 3), dtype=np.int8)
         state[:, 1] = -1
-        assert self.game.get_winner(state) == -1
+        assert self.game.get_winner(state, 1) == -1
 
     def test_diag_win(self):
         state = np.zeros((3, 3), dtype=np.int8)
         np.fill_diagonal(state, 1)
-        assert self.game.get_winner(state) == 1
+        assert self.game.get_winner(state, 1) == 1
 
     def test_draw(self):
         state = np.array([[1, -1, 1], [1, -1, -1], [-1, 1, 1]], dtype=np.int8)
-        assert self.game.get_winner(state) == 0
+        assert self.game.get_winner(state, 1) == 0
 
     def test_incomplete(self):
         state = np.zeros((3, 3), dtype=np.int8)
         state[0, 0] = 1
-        assert self.game.get_winner(state) is None
+        assert self.game.get_winner(state, 1) is None
 
     def test_encode_state(self):
         state = np.zeros((3, 3), dtype=np.int8)

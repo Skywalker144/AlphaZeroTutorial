@@ -12,8 +12,12 @@ class Gomoku:
         return np.zeros((self.board_size, self.board_size), dtype=np.int8)
 
     @staticmethod
-    def get_is_legal_actions(state, to_play):
+    def get_legal_action_mask(state, to_play):
         return state.flatten() == 0
+
+    def mask_illegal_actions(self, state, to_play, policy_logits):
+        """Return logits with illegal actions set to -inf before softmax."""
+        return np.where(self.get_legal_action_mask(state, to_play), policy_logits, -np.inf)
 
     def get_next_state(self, state, action, to_play):
         state = state.copy()
@@ -21,7 +25,14 @@ class Gomoku:
         state[row, col] = to_play
         return state
 
-    def get_winner(self, state):
+    def get_winner(self, state, to_play):
+        """Return the absolute winner: 1 (Black) / -1 (White) / 0 (draw) / None (ongoing).
+
+        ``to_play`` does not affect the result for this game (the winner is a
+        pure function of the board state); it is kept for interface
+        uniformity and forward compatibility with games whose outcome
+        depends on the side to move (e.g. Go with pass rules).
+        """
         size = self.board_size
         dirs = ((1, 0), (0, 1), (1, 1), (1, -1))
         for r in range(size):
@@ -45,8 +56,8 @@ class Gomoku:
             return 0
         return None
 
-    def is_terminal(self, state):
-        return self.get_winner(state) is not None
+    def is_terminal(self, state, to_play):
+        return self.get_winner(state, to_play) is not None
 
     def encode_state(self, state, to_play):
         size = self.board_size

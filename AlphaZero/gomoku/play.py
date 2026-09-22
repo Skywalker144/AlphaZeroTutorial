@@ -3,12 +3,12 @@ import numpy as np
 from alphazero import MCTS, ResNet, auto_device
 from alphazero.utils import print_board
 from envs.gomoku import Gomoku
-from gomoku.train import train_args
+from gomoku.train import board_size, train_args
 
 
 def main():
     device = auto_device()
-    game = Gomoku(board_size=train_args["board_size"])
+    game = Gomoku(board_size=board_size)
     model = ResNet(
         game.board_size,
         game.num_planes,
@@ -45,7 +45,7 @@ def main():
     to_play = 1
     print_board(state)
 
-    while not game.is_terminal(state):
+    while not game.is_terminal(state, to_play):
         if to_play == human_side:
             while True:
                 text = input("Your move (row col): ").strip()
@@ -55,7 +55,7 @@ def main():
                     print("Invalid input, use 'row col'.")
                     continue
                 action = row * game.board_size + col
-                if game.get_is_legal_actions(state, to_play)[action]:
+                if game.get_legal_action_mask(state, to_play)[action]:
                     break
                 print("Illegal move.")
         else:
@@ -68,7 +68,7 @@ def main():
         to_play = -to_play
         print_board(state)
 
-    winner = game.get_winner(state)
+    winner = game.get_winner(state, to_play)
     if winner == 1:
         print("Black wins!")
     elif winner == -1:

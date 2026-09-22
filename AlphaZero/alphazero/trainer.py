@@ -15,26 +15,36 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .mcts import MCTS
+from .network import ResNet
 from .replay_buffer import ReplayBuffer
-from .utils import random_augment_batch
+from .utils import auto_device, random_augment_batch
 
 
 class AlphaZero:
-    def __init__(self, game, model, optimizer, args):
+    def __init__(self, game, args):
         self.game = game
-        self.model = model
-        self.optimizer = optimizer
         self.args = args
-        self.device = args.get("device", "cpu")
-        self.mcts = MCTS(game, args, model, self.device)
+        self.device = auto_device()
+        self.model = ResNet(
+            game.board_size,
+            game.num_planes,
+            num_blocks=args.get("num_blocks", 1),
+            num_channels=args.get("num_channels", 32),
+        ).to(self.device)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=args.get("lr", 1e-3),
+            weight_decay=args.get("weight_decay", 3e-4),
+        )
+        self.mcts = MCTS(game, args, self.model, self.device)
         self.replay_buffer = ReplayBuffer(
-            min_rows=args.get("min_rows", 150000),
-            taper_window_exponent=args.get("taper_window_exponent", 0.8),
-            expand_window_per_row=args.get("expand_window_per_row", 0.3),
-            keep_target_rows=args.get("keep_target_rows", 10000000),
+            min_rows=args.get("min_rows", 20000),
+            taper_window_exponent=args.get("taper_window_exponent", 0.675),
+            expand_window_per_row=args.get("expand_window_per_row", 0.4),
+            max_rows=args.get("max_rows", None),
         )
         self.replay_ratio = args.get("replay_ratio", 8)
-        self.bootstrap_games = args.get("bootstrap_games", 100)
+        self.bootstrap_games = args.get("bootstrap_games", 200)
         self.game_count = 0
         self.losses = {"total": [], "policy": [], "value": []}
         self._target_cum = 0.0
@@ -49,10 +59,10 @@ class AlphaZero:
 
     def _next_target_cum(self):
         needed = (
-            self.args.get("train_steps", 10) * self.args.get("batch_size", 64)
+            self.args.get("train_steps", 500) * self.args.get("batch_size", 128)
         ) / self.replay_ratio
         if self._target_cum <= 0.0:
-            self._target_cum = max(float(self.args.get("min_rows", 150000)), needed)
+            self._target_cum = max(float(self.args.get("min_rows", 20000)), needed)
         else:
             self._target_cum += needed
         return self._target_cum
@@ -75,9 +85,9 @@ class AlphaZero:
         memory = []
         state = self.game.get_initial_state()
         to_play = 1
-        while not self.game.is_terminal(state):
+        while not self.game.is_terminal(state, to_play):
 
-            mcts_policy = self.mcts.search(state, to_play, self.args.get("num_simulations", 200))
+            mcts_policy = self.mcts.search(state, to_play, self.args.get("num_simulations", 1.7 * self.game.board_size ** 2))
 
             memory.append({
                 "state": state,
@@ -85,12 +95,16 @@ class AlphaZero:
                 "mcts_policy": mcts_policy,
             })
 
-            action = np.random.choice(len(mcts_policy), p=mcts_policy)
+            half_life = self.args.get("half_life", self.game.board_size)
+            if len(memory) < half_life:
+                action = np.random.choice(len(mcts_policy), p=mcts_policy)
+            else:
+                action = int(np.argmax(mcts_policy))
 
             state = self.game.get_next_state(state, action, to_play)
             to_play = -to_play
 
-        winner = self.game.get_winner(state)
+        winner = self.game.get_winner(state, to_play)
         self.last_game_result = (winner, len(memory))
         return [
             {
@@ -102,7 +116,7 @@ class AlphaZero:
         ]
 
     def train_step(self):
-        batch = self.replay_buffer.sample(self.args.get("batch_size", 64))
+        batch = self.replay_buffer.sample(self.args.get("batch_size", 128))
         if not batch:
             return None
 
@@ -127,8 +141,6 @@ class AlphaZero:
 
         total_loss.backward()
         self.optimizer.step()
-        # MCTS shares this model object. Keep inference in eval mode after
-        # training so BatchNorm statistics are not updated by single states.
         self.model.eval()
         return total_loss.item(), policy_loss.item(), value_loss.item()
 
@@ -235,7 +247,7 @@ class AlphaZero:
 
     def learn(self):
         num_iterations = self.args.get("num_iterations", None)
-        train_steps = self.args.get("train_steps", 10)
+        train_steps = self.args.get("train_steps", 500)
         save_interval = self.args.get("save_interval", 10)
         try:
             for i in itertools.count(1):

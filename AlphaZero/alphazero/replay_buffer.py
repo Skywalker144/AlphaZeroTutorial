@@ -1,44 +1,18 @@
 import numpy as np
 
 
-def compute_desired_num_rows(
-    num_usable_rows,
-    min_rows,
-    add_to_data_rows,
-    taper_window_exponent,
-    expand_window_per_row,
-    taper_window_scale,
-    max_rows,
-):
-    """KataGo shuffler window size: desired training-window rows given total run rows."""
-    window_taper_offset = taper_window_scale if taper_window_scale is not None else min_rows
-    power_law_x = num_usable_rows - min_rows + window_taper_offset + add_to_data_rows
-    unscaled_power_law = (
-        power_law_x ** taper_window_exponent
-    ) - (window_taper_offset ** taper_window_exponent)
-    scaled_power_law = unscaled_power_law / (
-        taper_window_exponent * (window_taper_offset ** (taper_window_exponent - 1))
-    )
-    desired_num_rows = int(scaled_power_law * expand_window_per_row + min_rows)
-
-    desired_num_rows = max(desired_num_rows, min_rows)
-    if max_rows is not None:
-        desired_num_rows = min(desired_num_rows, max_rows)
-    return desired_num_rows
-
-
 class ReplayBuffer:
     def __init__(
         self,
-        min_rows=150000,
-        taper_window_exponent=0.8,
-        expand_window_per_row=0.3,
-        keep_target_rows=10000000,
+        min_rows=20000,
+        taper_window_exponent=0.675,
+        expand_window_per_row=0.4,
+        max_rows=None,
     ):
         self.min_rows = max(int(min_rows), 1)
         self.taper_window_exponent = float(taper_window_exponent)
         self.expand_window_per_row = float(expand_window_per_row)
-        self.keep_target_rows = max(int(keep_target_rows), 1)
+        self.max_rows = max(int(max_rows), 1) if max_rows is not None else None
         self.buffer = []
         self.total_samples_added = 0
 
@@ -46,23 +20,19 @@ class ReplayBuffer:
         return len(self.buffer)
 
     def window_size(self):
-        return compute_desired_num_rows(
-            num_usable_rows=self.total_samples_added,
-            min_rows=self.min_rows,
-            add_to_data_rows=0.0,
-            taper_window_exponent=self.taper_window_exponent,
-            expand_window_per_row=self.expand_window_per_row,
-            taper_window_scale=self.min_rows,
-            max_rows=None,
-        )
-
-    def capacity(self):
-        return min(self.window_size(), self.keep_target_rows)
+        e = self.taper_window_exponent
+        unscaled = (self.total_samples_added ** e) - (self.min_rows ** e)
+        scaled = unscaled / (e * self.min_rows ** (e - 1))
+        desired = int(scaled * self.expand_window_per_row + self.min_rows)
+        desired = max(desired, self.min_rows)
+        if self.max_rows is not None:
+            desired = min(desired, self.max_rows)
+        return desired
 
     def add_game(self, game_memory):
         self.buffer.extend(game_memory)
         self.total_samples_added += len(game_memory)
-        overflow = len(self.buffer) - self.capacity()
+        overflow = len(self.buffer) - self.window_size()
         if overflow > 0:
             del self.buffer[:overflow]
 

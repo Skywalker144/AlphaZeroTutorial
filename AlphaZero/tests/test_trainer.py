@@ -3,9 +3,8 @@ import os
 import numpy as np
 import pytest
 import torch
-import torch.optim as optim
 
-from alphazero import AlphaZero, ResNet
+from alphazero import AlphaZero
 from envs.tictactoe import TicTacToe
 
 
@@ -14,6 +13,8 @@ def tiny_args(tmp_path):
     return {
         "num_simulations": 8,
         "c_puct": 1.5,
+        "num_blocks": 1,
+        "num_channels": 8,
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
         "dirichlet_noise_weight": 0.25,
         "num_iterations": 2,
@@ -24,18 +25,14 @@ def tiny_args(tmp_path):
         "min_rows": 16,
         "taper_window_exponent": 1.0,
         "expand_window_per_row": 0.3,
-        "keep_target_rows": 1000,
         "save_interval": 1,
         "data_dir": str(tmp_path),
-        "device": "cpu",
     }
 
 
 class TestSelfplay:
     def test_generates_terminal_game(self, tiny_args):
-        game = TicTacToe()
-        model = ResNet(3, 3, num_blocks=1, num_channels=8)
-        az = AlphaZero(game, model, optim.Adam(model.parameters()), tiny_args)
+        az = AlphaZero(TicTacToe(), tiny_args)
         game_data = az.selfplay()
         assert len(game_data) > 0
         for sample in game_data:
@@ -47,24 +44,20 @@ class TestSelfplay:
 
     def test_training_returns_shared_model_to_eval_mode(self, tiny_args):
         args = {**tiny_args, "batch_size": 1, "min_rows": 1}
-        game = TicTacToe()
-        model = ResNet(3, 3, num_blocks=1, num_channels=8)
-        az = AlphaZero(game, model, optim.Adam(model.parameters()), args)
+        az = AlphaZero(TicTacToe(), args)
         az.replay_buffer.add_game(az.selfplay())
 
         assert az.train_step() is not None
-        assert not model.training
-        before = model.start_layer[1].running_mean.detach().clone()
+        assert not az.model.training
+        before = az.model.start_layer[1].running_mean.detach().clone()
         az.selfplay()
-        after = model.start_layer[1].running_mean.detach()
+        after = az.model.start_layer[1].running_mean.detach()
         assert torch.equal(after, before)
 
 
 class TestValueTargets:
     def test_value_target_from_player_view(self, tiny_args):
-        game = TicTacToe()
-        model = ResNet(3, 3, num_blocks=1, num_channels=8)
-        az = AlphaZero(game, model, optim.Adam(model.parameters()), tiny_args)
+        az = AlphaZero(TicTacToe(), tiny_args)
         game_data = az.selfplay()
         winner = az.last_game_result[0]
         for sample in game_data:
@@ -74,10 +67,7 @@ class TestValueTargets:
 
 class TestCheckpoint:
     def test_roundtrip(self, tiny_args):
-        game = TicTacToe()
-        model = ResNet(3, 3, num_blocks=1, num_channels=8)
-        optimizer = optim.Adam(model.parameters())
-        az = AlphaZero(game, model, optimizer, tiny_args)
+        az = AlphaZero(TicTacToe(), tiny_args)
 
         for _ in range(3):
             az.replay_buffer.add_game(az.selfplay())
@@ -89,12 +79,7 @@ class TestCheckpoint:
         path = os.path.join(tiny_args["data_dir"], "checkpoints", "roundtrip.pth")
         assert os.path.exists(path)
 
-        az2 = AlphaZero(
-            TicTacToe(),
-            ResNet(3, 3, num_blocks=1, num_channels=8),
-            optim.Adam(ResNet(3, 3, num_blocks=1, num_channels=8).parameters()),
-            tiny_args,
-        )
+        az2 = AlphaZero(TicTacToe(), tiny_args)
         assert az2.load_checkpoint(path)
         for p1, p2 in zip(az.model.parameters(), az2.model.parameters()):
             assert torch.equal(p1.data, p2.data)
@@ -104,22 +89,14 @@ class TestCheckpoint:
         assert az2.replay_buffer.total_samples_added == az.replay_buffer.total_samples_added
 
     def test_load_latest_when_no_filename(self, tiny_args):
-        game = TicTacToe()
-        model = ResNet(3, 3, num_blocks=1, num_channels=8)
-        az = AlphaZero(game, model, optim.Adam(model.parameters()), tiny_args)
+        az = AlphaZero(TicTacToe(), tiny_args)
         az.save_checkpoint("a.pth")
         assert az.load_checkpoint() is True
 
 
 class TestReplayBuffer:
     def test_not_ready_below_min(self, tiny_args):
-        game = TicTacToe()
-        az = AlphaZero(
-            game,
-            ResNet(3, 3, num_blocks=1, num_channels=8),
-            optim.Adam(ResNet(3, 3, num_blocks=1, num_channels=8).parameters()),
-            tiny_args,
-        )
+        az = AlphaZero(TicTacToe(), tiny_args)
         az.replay_buffer.add_game(az.selfplay())
         assert not az.replay_buffer.is_ready()
         assert az.train_step() is None
@@ -128,27 +105,31 @@ class TestReplayBuffer:
         from alphazero.replay_buffer import ReplayBuffer
 
         buf = ReplayBuffer(
-            min_rows=100, taper_window_exponent=1.0, expand_window_per_row=0.3, keep_target_rows=10000
+            min_rows=100, taper_window_exponent=1.0, expand_window_per_row=0.3
         )
         buf.total_samples_added = 100
         assert buf.window_size() == 100
         buf.total_samples_added = 1000
         assert buf.window_size() == 370
 
-    def test_capacity_capped_by_keep_target_rows(self):
+    def test_capacity_capped_by_max_rows(self):
         from alphazero.replay_buffer import ReplayBuffer
 
         buf = ReplayBuffer(
-            min_rows=100, taper_window_exponent=1.0, expand_window_per_row=0.3, keep_target_rows=150
+            min_rows=100,
+            taper_window_exponent=1.0,
+            expand_window_per_row=0.3,
+            max_rows=200,
         )
         buf.total_samples_added = 1000
-        assert buf.capacity() == 150
+        # 窗口自然增长到 370, 但被 max_rows 封顶在 200
+        assert buf.window_size() == 200
 
     def test_evicts_oldest_beyond_capacity(self):
         from alphazero.replay_buffer import ReplayBuffer
 
         buf = ReplayBuffer(
-            min_rows=4, taper_window_exponent=1.0, expand_window_per_row=0.0, keep_target_rows=8
+            min_rows=4, taper_window_exponent=1.0, expand_window_per_row=0.0
         )
         buf.add_game([{"i": i} for i in range(4)])
         buf.add_game([{"i": 4}])
@@ -156,12 +137,25 @@ class TestReplayBuffer:
         assert buf.buffer[0]["i"] == 1
         assert buf.buffer[-1]["i"] == 4
 
+    def test_sample_uniform_from_window(self):
+        from alphazero.replay_buffer import ReplayBuffer
+
+        np.random.seed(0)
+        buf = ReplayBuffer(
+            min_rows=10, taper_window_exponent=1.0, expand_window_per_row=0.0
+        )
+        buf.add_game([{"i": i} for i in range(10)])
+        # 窗口内所有样本(包括老样本)都可被采样到
+        seen = set()
+        for _ in range(50):
+            batch = buf.sample(4)
+            seen.update(row["i"] for row in batch)
+        assert seen == set(range(10))
+
 
 class TestAdaptiveGames:
     def _make_az(self, args):
-        game = TicTacToe()
-        model = ResNet(3, 3, num_blocks=1, num_channels=8)
-        return AlphaZero(game, model, optim.Adam(model.parameters()), args)
+        return AlphaZero(TicTacToe(), args)
 
     def test_target_cum_seeds_with_min_rows(self, tiny_args):
         az = self._make_az(tiny_args)

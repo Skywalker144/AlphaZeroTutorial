@@ -6,17 +6,15 @@ import torch.nn.functional as F
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
+        self.norm1 = nn.GroupNorm(1, channels)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
+        self.norm2 = nn.GroupNorm(1, channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        identity = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += identity
-        return F.relu(out)
+        out = self.conv1(F.silu(self.norm1(x)))
+        out = self.conv2(F.silu(self.norm2(out)))
+        return out + x
 
 
 class ResNet(nn.Module):
@@ -27,27 +25,27 @@ class ResNet(nn.Module):
 
         self.start_layer = nn.Sequential(
             nn.Conv2d(num_planes, num_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(num_channels),
-            nn.ReLU(inplace=True),
+            nn.GroupNorm(1, num_channels),
+            nn.SiLU(inplace=True),
         )
 
         self.trunk = nn.ModuleList([ResBlock(num_channels) for _ in range(num_blocks)])
 
         self.policy_head = nn.Sequential(
-            nn.Conv2d(num_channels, 2, kernel_size=1, bias=False),
-            nn.BatchNorm2d(2),
-            nn.ReLU(inplace=True),
-            nn.Flatten(),
-            nn.Linear(2 * self.action_size, self.action_size),
+            nn.Conv2d(num_channels, num_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(1, num_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(num_channels, 1, kernel_size=1, bias=True),
         )
 
         self.value_head = nn.Sequential(
-            nn.Conv2d(num_channels, 1, kernel_size=1, bias=False),
-            nn.BatchNorm2d(1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(num_channels, num_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(1, num_channels),
+            nn.SiLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(self.action_size, num_channels // 2),
-            nn.ReLU(inplace=True),
+            nn.Linear(num_channels, num_channels // 2),
+            nn.SiLU(inplace=True),
             nn.Linear(num_channels // 2, 1),
         )
 
@@ -55,6 +53,6 @@ class ResNet(nn.Module):
         x = self.start_layer(x)
         for block in self.trunk:
             x = block(x)
-        policy_logits = self.policy_head(x)
+        policy_logits = self.policy_head(x).flatten(1)
         value = torch.tanh(self.value_head(x))
         return policy_logits, value
