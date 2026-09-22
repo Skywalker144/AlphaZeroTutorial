@@ -291,7 +291,7 @@ class _GameSession:
             legal_actions_mask = game.get_legal_action_mask(
                 _materialize(node, game), node.to_play
             )
-        if node is search.root:
+        if node is search.root and self.args.get("mode", "train") == "train":
             policy = add_dirichlet_noise(
                 policy,
                 self.dirichlet_concentration,

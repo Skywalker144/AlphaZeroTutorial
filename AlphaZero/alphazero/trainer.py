@@ -203,7 +203,7 @@ class AlphaZero:
         to_play = 1
         while not self.game.is_terminal(state, to_play):
 
-            mcts_policy = self.mcts.search(
+            mcts_policy, _ = self.mcts.search(
                 state, to_play,
                 num_simulations=self.args.get("num_simulations", 1.7 * self.game.board_size ** 2)
             )

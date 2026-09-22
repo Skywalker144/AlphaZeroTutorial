@@ -6,6 +6,7 @@ from envs.tictactoe import TicTacToe
 board_size = 3
 
 train_args = {
+    "mode": "train",
     "num_blocks": 1,
     "num_channels": 16,
     "num_simulations": 50,

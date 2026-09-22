@@ -81,15 +81,22 @@ class MCTS:
 
     @torch.inference_mode()
     def search(self, state, to_play, num_simulations):
-        root = Node(state, to_play)
 
         policy, value = self.nn_inference(state, to_play)
-        policy = add_dirichlet_noise(
-            policy,
-            self.args.get("dirichlet_total_concentration", 0.03 * self.game.board_size ** 2),
-            legal_actions_mask=self.game.get_legal_action_mask(state, to_play),
-            noise_weight=self.args.get("dirichlet_noise_weight", 0.25),
-        )
+        
+        if self.args.get("mode", "train") == "eval" and num_simulations == 0:
+            return policy, value
+
+        root = Node(state, to_play)
+
+        if self.args.get("mode", "train") == "train":
+            policy = add_dirichlet_noise(
+                policy,
+                self.args.get("dirichlet_total_concentration", 0.03 * self.game.board_size ** 2),
+                legal_actions_mask=self.game.get_legal_action_mask(state, to_play),
+                noise_weight=self.args.get("dirichlet_noise_weight", 0.25),
+            )
+
         self.expand(root, policy)
         self.backpropagate(root, value)
 
@@ -110,4 +117,4 @@ class MCTS:
         for child in root.children:
             mcts_policy[child.action_taken] = child.visits
         mcts_policy /= np.sum(mcts_policy)
-        return mcts_policy
+        return mcts_policy, root.q_value()

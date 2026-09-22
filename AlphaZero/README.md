@@ -15,6 +15,8 @@ python -m pip install -r requirements.txt
 # 井字棋
 python -m tictactoe.train
 python -m tictactoe.play
+python -m tictactoe.play -n 0   # 纯网络，不做 MCTS 搜索
+python -m tictactoe.play -n 1000   # 搜索 1000 次
 
 # 五子棋
 python -m gomoku.train
@@ -45,14 +47,14 @@ python -m pytest tests/ -q
 
 ## 配置与训练产物
 
-训练配置分别位于 [tictactoe/train.py](tictactoe/train.py) 和 [gomoku/train.py](gomoku/train.py) 的 `train_args` 中；当前没有单独的 `config.py` 或命令行参数解析。训练产物默认生成在对应游戏目录下的 `data/`，例如运行 `python -m tictactoe.train` 会写入 `tictactoe/data/`，内含 `models/`、`checkpoints/` 和统计图片。
+训练配置分别位于 [tictactoe/train.py](tictactoe/train.py) 和 [gomoku/train.py](gomoku/train.py) 的 `train_args` 中（含 `mode`：训练为 `train`，对弈时自动切为 `eval` 以关闭 Dirichlet 噪声）；对弈入口额外支持命令行参数 `-n/--num-simulations` 覆盖 MCTS 模拟次数，`0` 表示纯网络。训练产物默认生成在对应游戏目录下的 `data/`，例如运行 `python -m tictactoe.train` 会写入 `tictactoe/data/`，内含 `models/`、`checkpoints/` 和统计图片。
 
 - 迭代从 0 开始：第 0 轮收集固定的 `bootstrap_games` 局用于估计平均行长，第 1 轮据此补跑到 `min_rows`（乘以 1.05 的余量因子），之后按目标回放比自适应。
 - 默认持续训练，`Ctrl+C` 或正常结束都会保存完整 checkpoint 和曲线。`num_iterations` 表示目标总迭代数，达到后停止；不设置则持续训练。
 - 训练开始时自动恢复 `data/checkpoints/checkpoint.pth`（若存在），迭代编号、回放数据与训练统计都接着继续。开启独立实验时使用不同的 `data_dir`。
 - 每 `save_interval` 轮迭代：模型权重另存为 `data/models/model_<iter>.pth`，完整状态覆盖写入 `data/checkpoints/checkpoint.pth`（只保留最新一份，用于续训）。
 - 每个迭代结束后都会更新 `data/` 根目录下的训练面板图 `training.png`（损失、胜率、行长度的深色 2×2 dashboard），并导出可复现绘图的 `losses.csv` 与 `games.csv`。这些产物不纳入 Git。
-- 对弈入口会询问 checkpoint 路径；回车选择最新文件，没有文件时使用随机权重。落子输入为从零开始的行、列坐标。
+- 对弈入口自动加载最新可用的模型权重（`checkpoints/` 或 `models/` 中按修改时间最新的可读文件，没有则使用随机权重），并在 AlphaZero 落子时打印 MCTS 访问分布与根节点价值估计；落子输入为从零开始的行、列坐标。
 
 默认配置面向持续训练。仅检查流程时，应使用较小网络、较少搜索次数、较低的 `min_rows`、较小批次和有限的训练轮数；同时确保回放缓冲区能提供完整批次。
 

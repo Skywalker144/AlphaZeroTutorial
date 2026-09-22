@@ -6,6 +6,7 @@ from envs.gomoku import Gomoku
 board_size = 9
 
 train_args = {
+    "mode": "train",
     "num_blocks": 1,
     "num_channels": 32,
     "num_simulations": 100,

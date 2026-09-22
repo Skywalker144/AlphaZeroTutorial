@@ -94,14 +94,14 @@ class TestMCTS:
     def test_policy_sums_to_one(self):
         game, mcts = make_mcts()
         state = game.get_initial_state()
-        policy = mcts.search(state, 1, 20)
+        policy, _ = mcts.search(state, 1, 20)
         assert np.isclose(policy.sum(), 1.0)
 
     def test_policy_only_on_legal(self):
         game, mcts = make_mcts()
         state = game.get_initial_state()
         state[0, 0] = 1
-        policy = mcts.search(state, -1, 20)
+        policy, _ = mcts.search(state, -1, 20)
         assert policy[0] == 0.0
 
     def test_terminal_value_correct(self):
@@ -115,7 +115,7 @@ class TestMCTS:
         # Four in a row pinned against the left edge: (4, 4) is the only win.
         state = np.zeros((9, 9), dtype=np.int8)
         state[4, 0:4] = 1
-        policy = mcts.search(state, 1, 120)
+        policy, _ = mcts.search(state, 1, 120)
         assert np.argmax(policy) == 4 * 9 + 4
         assert policy[4 * 9 + 4] > 0.5
 
@@ -126,6 +126,6 @@ class TestMCTS:
         model.eval()
         args = {"c_puct": 1.5, "dirichlet_total_concentration": 0.03 * 9 ** 2, "dirichlet_noise_weight": 0.0}
         state = game.get_initial_state()
-        p1 = MCTS(game, args, model, "cpu").search(state, 1, 15)
-        p2 = MCTS(game, args, model, "cpu").search(state, 1, 15)
+        p1, _ = MCTS(game, args, model, "cpu").search(state, 1, 15)
+        p2, _ = MCTS(game, args, model, "cpu").search(state, 1, 15)
         assert np.array_equal(p1, p2)
