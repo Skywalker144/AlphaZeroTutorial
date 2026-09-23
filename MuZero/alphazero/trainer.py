@@ -260,6 +260,9 @@ class MuZero:
         value_targets = torch.tensor(
             np.array([s["value_targets"] for s in batch]), dtype=torch.float32, device=self.device
         )
+        to_plays = torch.tensor(
+            np.array([s["to_plays"] for s in batch]), dtype=torch.float32, device=self.device
+        )
         policy_mask = torch.tensor(
             np.array([s["policy_mask"] for s in batch]), dtype=torch.float32, device=self.device
         )
@@ -283,7 +286,7 @@ class MuZero:
             value_loss = value_loss + value_term
             step_losses.append(((policy_term + value_term) / batch_size).item())
             if k < unroll_steps:
-                hidden_state = self.model.dynamics(hidden_state, actions[:, k])
+                hidden_state = self.model.dynamics(hidden_state, actions[:, k], to_plays[:, k + 1])
 
         denominator = batch_size * (unroll_steps + 1)
         policy_loss = policy_loss / denominator

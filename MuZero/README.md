@@ -36,7 +36,7 @@ python -m pytest tests/ -q
 | 模块 | 内容 |
 | --- | --- |
 | [井字棋环境](envs/tictactoe.py)、[五子棋环境](envs/gomoku.py) | 状态、合法动作、落子、胜负与网络输入编码 |
-| [network.py](alphazero/network.py) | 三个模块：Representation `h`、Dynamics `g`、Prediction `f` |
+| [network.py](alphazero/network.py) | 三个模块：Representation `h`、Dynamics `g`（输入隐状态 + 动作编码 + to-play 平面）、Prediction `f` |
 | [mcts.py](alphazero/mcts.py) | 隐状态 MCTS：根用 `h`+`f` 并对真实棋盘屏蔽合法动作，树内用 `g`+`f` 按完整动作空间展开 |
 | [alphazero_parallel.py](alphazero/alphazero_parallel.py) | 并行自我对弈：跨对局合并 batch，两段式推理（先 `h`/`g` 再 `f`） |
 | [replay_buffer.py](alphazero/replay_buffer.py) | 整局历史、窗口裁剪、按起点构造 K 步展开样本 |
@@ -56,6 +56,6 @@ python -m pytest tests/ -q
 
 - 自我对弈默认走**并行**后端（跨对局把待评估节点合并成 batch 推理，`parallel=False` 退回串行）；`num_parallel_games` 控制同时活跃的对局数，默认 32。`num_parallel_games=1` 时并行后端与串行逐位一致，见 [tests/test_parallel.py](tests/test_parallel.py) 的等价性测试。
 - 隐状态搜索中，树内节点按**完整动作空间**展开，不查询真实棋盘的合法动作，也不在树内判断终局；只有根节点用环境给出的合法动作屏蔽先验。真实规则仍用于推进实际对局和判定胜负。
-- 按 [MuZero.md](../docs/MuZero.md) 的棋类约定，**省略 reward 分支**：value 直接学习最终胜负（标量 `tanh`，不是胜/平/负三分类），训练时终局之后的步屏蔽 policy loss、value 目标按交替视角沿用最终胜负。
+- 按 [MuZero.md](../docs/MuZero.md) 的棋类约定，**省略 reward 分支**：value 直接学习最终胜负（标量 `tanh`，不是胜/平/负三分类），训练时终局之后的步屏蔽 policy loss、value 目标按交替视角沿用最终胜负；`g` 额外接收该步的 to-play 平面，使终局后冻结的隐状态仍能显式区分视角。
 - 训练沿 `h → g → g → …` 展开 K 步，K+1 组 policy/value 损失的梯度同时更新 `h`、`g`、`f`。
 - 当前没有系统化的棋力评估入口；自我对弈胜率与训练损失只用于观察流程。

@@ -325,7 +325,12 @@ class ParallelSelfPlayer:
                 dtype=torch.long,
                 device=self.device,
             )
-            tree_hidden = self.model.dynamics(parent_hidden, actions)
+            to_plays = torch.tensor(
+                [nodes[i].to_play for i in tree_idx],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            tree_hidden = self.model.dynamics(parent_hidden, actions, to_plays)
             for k, i in enumerate(tree_idx):
                 hidden[i] = tree_hidden[k:k + 1]
 

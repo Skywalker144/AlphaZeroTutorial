@@ -212,6 +212,7 @@ class TestReplayBuffer:
             assert sample["policy_targets"].shape == (4, 9)
             assert sample["value_targets"].shape == (4,)
             assert sample["policy_mask"].shape == (4,)
+            assert sample["to_plays"].shape == (4,)
 
     def test_terminal_steps_mask_policy_and_absorb_value(self):
         from alphazero.replay_buffer import ReplayBuffer
@@ -230,6 +231,8 @@ class TestReplayBuffer:
         assert list(sample["policy_mask"]) == [1.0, 1.0, 0.0, 0.0]
         # 终局之后 value 目标按交替视角沿用最终胜负
         assert list(sample["value_targets"]) == [1.0, -1.0, 1.0, -1.0]
+        # dynamics 显式拿到每步视角的 to-play 平面
+        assert list(sample["to_plays"]) == [1.0, -1.0, 1.0, -1.0]
 
 
 class TestLearnLoop:

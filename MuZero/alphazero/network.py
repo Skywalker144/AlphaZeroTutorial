@@ -39,13 +39,13 @@ class DynamicsNet(nn.Module):
         super().__init__()
         self.board_size = board_size
         self.start_layer = nn.Sequential(
-            nn.Conv2d(num_channels + 1, num_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(num_channels + 2, num_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(1, num_channels),
             nn.SiLU(inplace=True),
         )
         self.trunk = nn.ModuleList([ResBlock(num_channels) for _ in range(num_blocks)])
 
-    def forward(self, hidden_state, action):
+    def forward(self, hidden_state, action, to_play):
         action_plane = torch.zeros(
             hidden_state.shape[0],
             1,
@@ -58,7 +58,13 @@ class DynamicsNet(nn.Module):
         col = action % self.board_size
         batch_index = torch.arange(hidden_state.shape[0], device=hidden_state.device)
         action_plane[batch_index, 0, row, col] = 1.0
-        x = torch.cat([hidden_state, action_plane], dim=1)
+        to_play_plane = (
+            (to_play > 0)
+            .to(hidden_state.dtype)
+            .view(-1, 1, 1, 1)
+            .expand(-1, 1, self.board_size, self.board_size)
+        )
+        x = torch.cat([hidden_state, action_plane, to_play_plane], dim=1)
         x = self.start_layer(x)
         for block in self.trunk:
             x = block(x)
@@ -103,5 +109,5 @@ class MuZeroNet(nn.Module):
     def initial_inference(self, observation):
         return self.prediction(self.representation(observation))
 
-    def recurrent_inference(self, hidden_state, action):
-        return self.prediction(self.dynamics(hidden_state, action))
+    def recurrent_inference(self, hidden_state, action, to_play):
+        return self.prediction(self.dynamics(hidden_state, action, to_play))

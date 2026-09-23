@@ -46,9 +46,10 @@ class MCTS:
         return policy_logits, float(value.item())
 
     @torch.inference_mode()
-    def dynamics(self, hidden_state, action):
+    def dynamics(self, hidden_state, action, to_play):
         action_tensor = torch.tensor([action], dtype=torch.long, device=self.device)
-        return self.model.dynamics(hidden_state, action_tensor)
+        to_play_tensor = torch.tensor([to_play], dtype=torch.float32, device=self.device)
+        return self.model.dynamics(hidden_state, action_tensor, to_play_tensor)
 
     def select(self, node):
         # 选择 PUCT值 最大的节点
@@ -118,7 +119,7 @@ class MCTS:
             while node.children:
                 node = self.select(node)
 
-            node.hidden_state = self.dynamics(node.parent.hidden_state, node.action_taken)
+            node.hidden_state = self.dynamics(node.parent.hidden_state, node.action_taken, node.to_play)
             policy_logits, value = self.prediction(node.hidden_state)
             self.expand(node, softmax(policy_logits))
             self.backpropagate(node, value)

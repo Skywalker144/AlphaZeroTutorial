@@ -60,8 +60,11 @@ class ReplayBuffer:
         policy_targets = np.zeros((unroll_steps + 1, action_size), dtype=np.float32)
         value_targets = np.zeros(unroll_steps + 1, dtype=np.float32)
         policy_mask = np.zeros(unroll_steps + 1, dtype=np.float32)
+        to_plays = np.zeros(unroll_steps + 1, dtype=np.float32)
         base_value = game[start]["value_target"]
+        start_player = game[start]["player"]
         for i in range(unroll_steps + 1):
+            to_plays[i] = start_player * ((-1) ** i)
             if start + i < length:
                 step = game[start + i]
                 policy_targets[i] = step["mcts_policy"]
@@ -78,6 +81,7 @@ class ReplayBuffer:
             "policy_targets": policy_targets,
             "value_targets": value_targets,
             "policy_mask": policy_mask,
+            "to_plays": to_plays,
         }
 
     def is_ready(self):
