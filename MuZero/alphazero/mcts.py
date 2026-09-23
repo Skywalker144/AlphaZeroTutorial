@@ -52,11 +52,15 @@ class MCTS:
 
     def select(self, node):
         # 选择 PUCT值 最大的节点
-        c_puct = self.args.get("c_puct", 1.5)
+        pb_c_base = self.args.get("pb_c_base", 19652)
+        pb_c_init = self.args.get("pb_c_init", 1.25)
+        pb_c = math.log((node.visits + pb_c_base + 1) / pb_c_base) + pb_c_init
+        pb_c *= math.sqrt(node.visits)
         best_score = -float("inf")
         best_child = None
         for child in node.children:
-            score = -child.q_value() + c_puct * child.prior * math.sqrt(node.visits) / (1 + child.visits)
+            value = (1.0 - child.q_value()) / 2.0 if child.visits else 0.0
+            score = value + pb_c * child.prior / (1 + child.visits)
             if score > best_score:
                 best_score = score
                 best_child = child

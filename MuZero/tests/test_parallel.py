@@ -12,7 +12,8 @@ from envs.tictactoe import TicTacToe
 def make_args(**overrides):
     args = {
         "num_simulations": 8,
-        "c_puct": 1.5,
+        "pb_c_init": 1.25,
+        "pb_c_base": 19652,
         "num_blocks": 1,
         "num_channels": 8,
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
@@ -141,13 +142,15 @@ class TestGames:
 
 
 class TestEquivalence:
-    def test_single_game_matches_sequential_backend(self):
+    @pytest.mark.parametrize("pb_c_base, pb_c_init", [(19652, 1.25), (10, 0.5)])
+    def test_single_game_matches_sequential_backend(self, pb_c_base, pb_c_init):
         # num_parallel_games=1 时，并行后端每轮 batch=1，推理结果与串行版
         # 逐位一致，且 RNG 消耗顺序也相同，因此应当产生完全相同的对局。
         game = TicTacToe()
         base_args = {
             "num_simulations": 12,
-            "c_puct": 1.5,
+            "pb_c_init": pb_c_init,
+            "pb_c_base": pb_c_base,
             "num_blocks": 1,
             "num_channels": 8,
             "dirichlet_total_concentration": 0.03 * 3 ** 2,
@@ -175,7 +178,8 @@ class TestTrainerIntegration:
     def tiny_args(self, tmp_path):
         return {
             "num_simulations": 8,
-            "c_puct": 1.5,
+            "pb_c_init": 1.25,
+            "pb_c_base": 19652,
             "num_blocks": 1,
             "num_channels": 8,
             "dirichlet_total_concentration": 0.03 * 3 ** 2,

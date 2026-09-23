@@ -203,7 +203,7 @@ child.hidden_state = dynamics_network(parent.hidden_state, action)
 policy_logits, value = prediction_network(node.hidden_state)
 ```
 
-下面是突出主流程的伪代码，沿用 AlphaZero 的固定 `c_puct` 写法，省略批量推理等工程细节。搜索时将网络的 batch 维取出，policy 按动作编号索引，value 作为标量使用。`Node` 默认 `n=0`、`v=0`、`children={}`，其中 `v` 存储累计价值，`is_expanded()` 表示已经创建子节点。
+下面是突出主流程的伪代码，探索系数采用 MuZero 官方伪代码中随父节点访问次数增长的形式，省略批量推理等工程细节。搜索时将网络的 batch 维取出，policy 按动作编号索引，value 作为标量使用。`Node` 默认 `n=0`、`v=0`、`children={}`，其中 `v` 存储累计价值，`is_expanded()` 表示已经创建子节点。
 
 ### 1、选择
 
@@ -218,14 +218,18 @@ def select(node):
     return max(node.children.values(), key=get_puct)
 
 
-def get_puct(node, c_puct=1.25):
+def get_puct(node, pb_c_base=19652, pb_c_init=1.25):
     # node.v / node.n 是子节点玩家的价值；对父节点玩家要取反
     q = -node.v / node.n if node.n > 0 else 0
-    u = c_puct * node.prior * sqrt(node.parent.n) / (1 + node.n)
-    return q + u
+    value_score = (q + 1) / 2 if node.n > 0 else 0
+    pb_c = log((node.parent.n + pb_c_base + 1) / pb_c_base) + pb_c_init
+    u = pb_c * sqrt(node.parent.n) * node.prior / (1 + node.n)
+    return value_score + u
 ```
 
-这部分和 AlphaZero 基本一致。区别发生在下一步：**未展开的节点没有真实棋盘，需要用 dynamics 生成隐状态。**
+这里 `pb_c_init=1.25`、`pb_c_base=19652` 与原版一致，串行与并行搜索使用相同公式。选择阶段将已访问动作的父节点玩家视角 Q 按 `(Q + 1) / 2` 缩放到 `[0,1]`，对应官方棋类配置的已知边界 `[-1,1]`；未访问动作的价值项直接取 `0`，不把初始 Q 映射成 `0.5`。缩放只用于选择评分，网络输出、价值回传和节点统计仍使用 `[-1,1]`。[官方伪代码](https://arxiv.org/src/1911.08265v2/anc/pseudocode.py)
+
+下一步中，**未展开的节点没有真实棋盘，需要用 dynamics 生成隐状态。**
 
 ### 2、扩展
 

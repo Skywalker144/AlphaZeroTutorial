@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from alphazero import MCTS, MuZeroNet, auto_device
+from alphazero.alphazero_parallel import _select
 from alphazero.mcts import Node
 from alphazero.utils import add_dirichlet_noise, softmax
 from envs.gomoku import Gomoku
@@ -11,7 +12,7 @@ from envs.gomoku import Gomoku
 def make_mcts(num_simulations=20):
     game = Gomoku(board_size=9)
     model = MuZeroNet(game.board_size, game.num_planes, num_blocks=1, num_channels=8)
-    args = {"num_simulations": num_simulations, "c_puct": 1.5, "dirichlet_total_concentration": 0.03 * 9 ** 2, "dirichlet_noise_weight": 0.25}
+    args = {"num_simulations": num_simulations, "pb_c_init": 1.25, "pb_c_base": 19652, "dirichlet_total_concentration": 0.03 * 9 ** 2, "dirichlet_noise_weight": 0.25}
     device = auto_device()
     return game, MCTS(game, args, model, device)
 
@@ -64,6 +65,51 @@ class TestDirichlet:
 
 
 class TestMCTS:
+    @pytest.mark.parametrize(
+        "args, expected_action",
+        [({}, 1), ({"pb_c_base": 1e9}, 0), ({"pb_c_init": 0.0}, 0)],
+    )
+    def test_visit_dependent_exploration_changes_selected_action(self, args, expected_action):
+        game = Gomoku(board_size=9)
+        model = MuZeroNet(9, 3, num_blocks=1, num_channels=8)
+        mcts = MCTS(game, args, model, "cpu")
+        root = Node(1)
+        root.visits = 19651
+        for action, prior, value in [(0, 0.1, -0.04), (1, 0.9, 0.0)]:
+            child = Node(-1, prior=prior, parent=root, action_taken=action)
+            child.visits = 9825
+            child.value_sum = value * child.visits
+            root.children.append(child)
+
+        assert mcts.select(root).action_taken == expected_action
+        assert _select(
+            root, args.get("pb_c_base", 19652), args.get("pb_c_init", 1.25)
+        ).action_taken == expected_action
+
+    @pytest.mark.parametrize(
+        "child_value, expected_action", [(-1.0, 0), (0.0, 0), (0.1, 0), (1.0, 1)]
+    )
+    def test_selection_scales_visited_values_but_keeps_unvisited_value_zero(
+        self, child_value, expected_action
+    ):
+        game = Gomoku(board_size=9)
+        model = MuZeroNet(9, 3, num_blocks=1, num_channels=8)
+        mcts = MCTS(game, {}, model, "cpu")
+        root = Node(1)
+        root.visits = 2
+        visited = Node(-1, prior=0.6, parent=root, action_taken=0)
+        visited.update(child_value)
+        unvisited = Node(-1, prior=0.4, parent=root, action_taken=1)
+        root.children = [visited, unvisited]
+
+        assert mcts.select(root).action_taken == expected_action
+        assert _select(root, 19652, 1.25).action_taken == expected_action
+        assert visited.q_value() == child_value
+        assert visited.value_sum == child_value
+        assert visited.visits == 1
+        assert unvisited.value_sum == 0.0
+        assert unvisited.visits == 0
+
     def test_policy_sums_to_one(self):
         game, mcts = make_mcts()
         state = game.get_initial_state()
@@ -98,7 +144,7 @@ class TestMCTS:
         game = Gomoku(board_size=9)
         model = MuZeroNet(9, 3, num_blocks=1, num_channels=8)
         model.eval()
-        args = {"c_puct": 1.5, "dirichlet_total_concentration": 0.03 * 9 ** 2, "dirichlet_noise_weight": 0.0}
+        args = {"pb_c_init": 1.25, "pb_c_base": 19652, "dirichlet_total_concentration": 0.03 * 9 ** 2, "dirichlet_noise_weight": 0.0}
         state = game.get_initial_state()
         p1, _ = MCTS(game, args, model, "cpu").search(state, 1, 15)
         p2, _ = MCTS(game, args, model, "cpu").search(state, 1, 15)

@@ -45,15 +45,16 @@ class _Node:
 # -- 与 MCTS 等价的树操作（自由函数版，供多棵树复用） ----------------------
 
 
-def _select(node, c_puct):
+def _select(node, pb_c_base, pb_c_init):
     """选择 PUCT 值最大的子节点（与 MCTS.select 一致）。"""
-    sqrt_visits = math.sqrt(node.visits)
+    pb_c = math.log((node.visits + pb_c_base + 1) / pb_c_base) + pb_c_init
+    pb_c *= math.sqrt(node.visits)
     best_score = -float("inf")
     best_child = None
     for child in node.children:
         visits = child.visits
-        value = -(child.value_sum / visits) if visits else 0.0
-        score = value + c_puct * child.prior * sqrt_visits / (1 + visits)
+        value = (1.0 - child.value_sum / visits) / 2.0 if visits else 0.0
+        score = value + pb_c * child.prior / (1 + visits)
         if score > best_score:
             best_score = score
             best_child = child
@@ -125,7 +126,8 @@ class _GameSession:
         "game",
         "args",
         "action_size",
-        "c_puct",
+        "pb_c_base",
+        "pb_c_init",
         "num_simulations",
         "mode",
         "half_life",
@@ -143,7 +145,8 @@ class _GameSession:
         self.args = args
         # 每局固定不变的超参数在构造时解析一次，避免每次模拟都查 args。
         self.action_size = game.board_size ** 2
-        self.c_puct = args.get("c_puct", 1.5)
+        self.pb_c_base = args.get("pb_c_base", 19652)
+        self.pb_c_init = args.get("pb_c_init", 1.25)
         self.num_simulations = int(
             args.get("num_simulations", 1.7 * game.board_size ** 2)
         )
@@ -223,7 +226,7 @@ class _GameSession:
 
             node = search.root
             while node.children:
-                node = _select(node, self.c_puct)
+                node = _select(node, self.pb_c_base, self.pb_c_init)
             # 一次模拟 = 走到一个叶子挂起等待批量评估，并计一次模拟。
             search.simulations += 1
             search.pending = node
@@ -280,7 +283,7 @@ class ParallelSelfPlayer:
         设为 False 退回串行 selfplay（见 trainer.MuZero）。
     num_parallel_games
         同时保持活跃的对局数，也约等于每轮批量推理的 batch 大小。默认 32。
-    其余搜索相关参数（num_simulations / c_puct / half_life /
+    其余搜索相关参数（num_simulations / pb_c_base / pb_c_init / half_life /
     dirichlet_total_concentration）含义与串行版完全相同。
     """
 

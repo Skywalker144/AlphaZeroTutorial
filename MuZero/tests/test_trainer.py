@@ -13,7 +13,8 @@ from envs.tictactoe import TicTacToe
 def tiny_args(tmp_path):
     return {
         "num_simulations": 8,
-        "c_puct": 1.5,
+        "pb_c_init": 1.25,
+        "pb_c_base": 19652,
         "num_blocks": 1,
         "num_channels": 8,
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
