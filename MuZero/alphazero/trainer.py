@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from .mcts import MCTS
 from .metrics import MetricsTracker
-from .network import MuZeroNet
+from .network import MuZeroNet, scale_gradient
 from .alphazero_parallel import ParallelSelfPlayer
 from .replay_buffer import ReplayBuffer
 from .scheduler import SelfPlayScheduler
@@ -260,9 +260,6 @@ class MuZero:
         value_targets = torch.tensor(
             np.array([s["value_targets"] for s in batch]), dtype=torch.float32, device=self.device
         )
-        to_plays = torch.tensor(
-            np.array([s["to_plays"] for s in batch]), dtype=torch.float32, device=self.device
-        )
         policy_mask = torch.tensor(
             np.array([s["policy_mask"] for s in batch]), dtype=torch.float32, device=self.device
         )
@@ -282,15 +279,20 @@ class MuZero:
             )
             policy_term = torch.sum(policy_mask[:, k] * step_policy)
             value_term = F.mse_loss(value, value_targets[:, k], reduction="sum")
-            policy_loss = policy_loss + policy_term
-            value_loss = value_loss + value_term
+            # 遵循官方伪代码：根预测权重为 1，K 个循环预测各为 1/K。
+            gradient_scale = 1.0 if k == 0 else 1.0 / unroll_steps
+            policy_loss = policy_loss + scale_gradient(policy_term, gradient_scale)
+            value_loss = value_loss + scale_gradient(value_term, gradient_scale)
             step_losses.append(((policy_term + value_term) / batch_size).item())
             if k < unroll_steps:
-                hidden_state = self.model.dynamics(hidden_state, actions[:, k], to_plays[:, k + 1])
+                # 当前预测使用未缩放的梯度；只有后续循环跨过此边界时乘 0.5。
+                # s^0 到首次 dynamics 的连接保持不变，与官方 update_weights 一致。
+                if k > 0:
+                    hidden_state = scale_gradient(hidden_state, 0.5)
+                hidden_state = self.model.dynamics(hidden_state, actions[:, k])
 
-        denominator = batch_size * (unroll_steps + 1)
-        policy_loss = policy_loss / denominator
-        value_loss = value_loss / denominator
+        policy_loss = policy_loss / batch_size
+        value_loss = value_loss / batch_size
         total_loss = policy_loss + self.args.get("value_loss_scale", 1.0) * value_loss
 
         total_loss.backward()

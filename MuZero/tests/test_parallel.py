@@ -73,7 +73,7 @@ class TestBatchedInference:
         # 树节点：g + f 与串行一致
         child = _Node(None, -1, prior=0.5, parent=root, action_taken=17)
         (child_logits, child_value), = player._batch_inference([child])
-        next_hidden = mcts.dynamics(hidden, 17, -1)
+        next_hidden = mcts.dynamics(hidden, 17)
         seq_logits, seq_value = mcts.prediction(next_hidden)
         assert np.allclose(child_logits, seq_logits, atol=1e-5)
         assert np.isclose(child_value, seq_value, atol=1e-5)

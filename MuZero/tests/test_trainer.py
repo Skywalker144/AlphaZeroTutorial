@@ -53,7 +53,9 @@ class TestSelfplay:
         mz = MuZero(TicTacToe(), args)
         mz.replay_buffer.add_game(mz.selfplay()[0])
 
-        assert mz.train_step() is not None
+        result = mz.train_step()
+        assert result is not None
+        assert all(np.isfinite(norm) and norm > 0 for norm in result["grad_norms"].values())
         assert not mz.model.training
         before = [p.detach().clone() for p in mz.model.parameters()]
         mz.selfplay()
@@ -68,6 +70,73 @@ class TestValueTargets:
         game_data, winner, _ = mz.selfplay()
         for sample in game_data:
             assert sample["value_target"] == float(winner) * sample["player"]
+
+
+class TestGradientScaling:
+    @pytest.mark.parametrize(
+        "unroll_steps, expected_h, expected_g, expected_f",
+        [(0, 2.0, 0.0, 2.0), (1, 4.0, 2.0, 4.0), (3, 19 / 6, 17 / 6, 4.0)],
+    )
+    def test_train_step_matches_analytic_gradients(
+        self, tiny_args, monkeypatch, unroll_steps, expected_h, expected_g, expected_f
+    ):
+        # h=w_h, g(s)=w_g*s, v(s)=w_f*s，所有权重初值为 1，value 目标为 0。
+        # K=3 时，h 的梯度为 2*[1+(1+1/2+1/4)/3]；
+        # g 的共享参数梯度为 2*[1+(1+1/2)+(1+1/2+1/4)]/3。
+        class Representation(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(()))
+
+            def forward(self, observation):
+                return observation.mean(dim=(1, 2, 3)) * self.weight
+
+        class Dynamics(Representation):
+            def forward(self, hidden, action):
+                return hidden * self.weight
+
+        class Prediction(Representation):
+            def __init__(self):
+                super().__init__()
+                self.logits = torch.nn.Parameter(torch.zeros(9))
+
+            def forward(self, hidden):
+                return self.logits.expand(hidden.shape[0], -1), hidden * self.weight
+
+        mz = MuZero(TicTacToe(), {
+            **tiny_args, "batch_size": 1, "min_rows": 1, "unroll_steps": unroll_steps,
+        })
+        mz.model = torch.nn.ModuleDict({
+            "representation": Representation(),
+            "dynamics": Dynamics(),
+            "prediction": Prediction(),
+        }).to(mz.device)
+        mz.optimizer = torch.optim.SGD(mz.model.parameters(), lr=0.01)
+        game = [{
+            "observation": np.ones((3, 3, 3), dtype=np.float32),
+            "player": (-1) ** k,
+            "action": 0,
+            "mcts_policy": np.eye(9, dtype=np.float32)[0],
+            "value_target": 0.0,
+        } for k in range(unroll_steps + 1)]
+        sample = mz.replay_buffer._build_sample(game, 0, unroll_steps, 9)
+        monkeypatch.setattr(mz.replay_buffer, "sample", lambda *args: [sample])
+        monkeypatch.setattr("alphazero.trainer.random_augment_batch", lambda batch, size: batch)
+
+        result = mz.train_step()
+
+        assert mz.model.representation.weight.grad.item() == pytest.approx(expected_h)
+        grad_g = mz.model.dynamics.weight.grad
+        assert (0.0 if grad_g is None else grad_g.item()) == pytest.approx(expected_g)
+        assert mz.model.prediction.weight.grad.item() == pytest.approx(expected_f)
+        policy_gradient = torch.full((9,), 1 / 9, device=mz.device)
+        policy_gradient[0] -= 1
+        if unroll_steps:
+            policy_gradient *= 2
+        torch.testing.assert_close(mz.model.prediction.logits.grad, policy_gradient)
+        # scale_gradient 只改变反向传播，日志记录各预测步损失之和的 batch 均值。
+        assert result["value"] == pytest.approx(unroll_steps + 1)
+        assert result["policy"] == pytest.approx((unroll_steps + 1) * np.log(9))
 
 
 class TestCheckpoint:
@@ -212,7 +281,6 @@ class TestReplayBuffer:
             assert sample["policy_targets"].shape == (4, 9)
             assert sample["value_targets"].shape == (4,)
             assert sample["policy_mask"].shape == (4,)
-            assert sample["to_plays"].shape == (4,)
 
     def test_terminal_steps_mask_policy_and_absorb_value(self):
         from alphazero.replay_buffer import ReplayBuffer
@@ -227,12 +295,10 @@ class TestReplayBuffer:
              "mcts_policy": np.full(9, 1.0 / 9), "value_target": -1.0},
         ]
         buf.add_game(game)
-        sample = buf.sample(1, unroll_steps=3, action_size=9)[0]
+        sample = buf._build_sample(game, start=0, unroll_steps=3, action_size=9)
         assert list(sample["policy_mask"]) == [1.0, 1.0, 0.0, 0.0]
         # 终局之后 value 目标按交替视角沿用最终胜负
         assert list(sample["value_targets"]) == [1.0, -1.0, 1.0, -1.0]
-        # dynamics 显式拿到每步视角的 to-play 平面
-        assert list(sample["to_plays"]) == [1.0, -1.0, 1.0, -1.0]
 
 
 class TestLearnLoop:
