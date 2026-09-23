@@ -4,10 +4,10 @@
 
 ```python
 # AlphaZero：按照真实规则，算出走完这一步后的棋盘
-next_state = game.get_next_state(state, action)
+next_state = game.get_next_state(state, action, to_play)
 
 # MuZero：用神经网络，算出走完这一步后的内部特征
-next_hidden_state = dynamics_network(hidden_state, action)
+next_hidden_state = model.dynamics(hidden_state, action)
 ```
 
 AlphaZero 搜索树里的节点保存**真实棋盘**，MuZero 搜索树里的节点保存**隐状态（hidden state）**。这个隐状态就是一个特征张量，后面所有模拟都在这些特征上继续计算。
@@ -22,26 +22,48 @@ AlphaZero 搜索树里的节点保存**真实棋盘**，MuZero 搜索树里的�
 
 **在原论文的棋类实现中，hidden state 的长宽确实与棋盘相同，通道数为 256。** 例如，忽略 batch 维度后，围棋是 `[256, 19, 19]`，国际象棋是 `[256, 8, 8]`，将棋是 `[256, 9, 9]`。这是网络架构的选择，MuZero 算法本身并不要求隐状态一定保留棋盘长宽。[原论文，网络输入与架构](https://arxiv.org/html/1911.08265v2#A5)
 
-为了把尺寸写得具体，下面统一用一个**15×15、每步选择一个位置落子、没有 pass 动作的五子棋示例**：
+为了把尺寸写得具体，下面统一用**本项目五子棋入口的配置：9×9 棋盘、32 个隐状态通道，每步选择一个位置落子，没有 pass 动作**：
 
 | 符号 | 含义 | 本文示例 |
 |---|---|---|
 | `B` | 一批棋局的数量 | 搜索时可取 `1` |
-| `H, W` | 棋盘长宽 | `15, 15` |
+| `H, W` | 棋盘长宽 | `9, 9` |
 | `C_in` | 输入棋局编码的通道数 | `3` |
-| `C` | hidden state 的通道数 | `128` |
-| `A` | 固定动作空间的大小 | `225` |
+| `C` | hidden state 的通道数 | `32` |
+| `A` | 固定动作空间的大小 | `81` |
 
-本文张量维度按 PyTorch 的 `[B, C, H, W]` 顺序书写。`3` 个输入通道、`128` 个隐状态通道是**教学示例的配置**，不是原论文的固定参数。
+本文张量维度按 PyTorch 的 `[B, C, H, W]` 顺序书写。`3` 个输入通道、`32` 个隐状态通道是[五子棋训练入口](../MuZero/gomoku/train.py)的配置，不是原论文的固定参数。
 
-```text
-真实棋盘                 编码后的棋盘                    hidden state
-[15, 15]      ──────>    [B, 3, 15, 15]      ── h ──>   [B, 128, 15, 15]
+### 先看三个模块怎样连接
+
+真实棋局先由 $h$ 编码成隐状态；$g$ 接收隐状态和动作，生成下一隐状态；$f$ 在每个隐状态上预测策略和价值。
+
+```mermaid
+flowchart LR
+    O["棋局编码 oₜ<br/>[B,3,9,9]"] --> H["Representation · h"]
+    H --> S0["隐状态 s⁰<br/>[B,32,9,9]"]
+    S0 --> F0["Prediction · f"]
+    F0 --> P0["策略 logits [B,81]<br/>价值 [B]"]
+    S0 --> G["Dynamics · g"]
+    A["动作 aₜ [B]<br/>编码为 [B,1,9,9]"] --> G
+    G --> S1["隐状态 s¹<br/>[B,32,9,9]"]
+    S1 --> F1["Prediction · f"]
+    F1 --> P1["策略 logits [B,81]<br/>价值 [B]"]
+
+    classDef representation fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef dynamics fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef prediction fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    class H representation
+    class G dynamics
+    class F0,F1 prediction
 ```
 
-可以把 `[128, 15, 15]` 理解成 **128 张叠在一起的 15×15 特征图**。但这些通道不是“第 1 层黑棋、第 2 层白棋”这样预先规定的棋盘层，而是网络自己学出的浮点数特征。
+图中两个 $f$ **共享同一套参数**。继续模拟时，把 $s^1$ 和下一个动作交给同一个 $g$，无需重新调用 $h$。网络输出的是 logits；softmax 和根节点的合法动作屏蔽放在搜索流程中处理。
 
-`hidden_state[:, :, row, col]` 取出该空间位置上的 128 维特征。经过多层卷积，这些特征可以包含周围甚至整个棋盘的信息，不能把它直接当成“这个格子上放了什么棋子”。**空间尺寸相同，不代表每个数都有真实棋盘上的明确含义。**
+
+可以把 `[32, 9, 9]` 理解成 **32 张叠在一起的 9×9 特征图**。但这些通道不是“第 1 层黑棋、第 2 层白棋”这样预先规定的棋盘层，而是网络自己学出的浮点数特征。
+
+`hidden_state[:, :, row, col]` 取出该空间位置上的 32 维特征。经过多层卷积，这些特征可以包含周围甚至整个棋盘的信息，不能把它直接当成“这个格子上放了什么棋子”。**空间尺寸相同，不代表每个数都有真实棋盘上的明确含义。**
 
 实现中，$h$ 和每次 $g$ 输出的隐状态都会按样本独立归一化：在该样本全部 `C×H×W` 元素上取最小值和最大值，计算 $(s-\min s)/(\max s-\min s)$，使其与动作平面同处于 `[0,1]`。常量隐状态映射为全零，避免除零。该操作保留梯度，训练、串行搜索和批量搜索共用 [network.py](../MuZero/alphazero/network.py) 中的实现。[原论文，附录 G](https://arxiv.org/html/1911.08265v2#A7)
 
@@ -62,22 +84,17 @@ observation[:, 0] = 当前玩家的棋子位置    # 有棋子为 1，否则为 
 observation[:, 1] = 对手的棋子位置        # 有棋子为 1，否则为 0
 observation[:, 2] = 当前玩家身份          # 黑方时整层为 1，白方时整层为 0
 
-# observation.shape == [B, 3, 15, 15]
-hidden_state = representation_network(observation)
-# hidden_state.shape == [B, 128, 15, 15]
+# observation.shape == [B, 3, 9, 9]
+hidden_state = model.representation(observation)
+# hidden_state.shape == [B, 32, 9, 9]
 ```
 
-一种实现方式是：
+经过 representation 网络后：
 
-```text
-[B, 3, 15, 15]
-      │
-      ▼  3×3 卷积：3 个输入通道 → 128 个输出通道
-      │  stride=1, padding=1，长宽保持不变
-[B, 128, 15, 15]
-      │
-      ▼  若干残差块：保持通道数和长宽
-[B, 128, 15, 15] = s⁰
+```mermaid
+flowchart LR
+    O["棋局编码<br/>[B,3,9,9]"] --> H["Representation · h"]
+    H --> S["隐状态<br/>[B,32,9,9]"]
 ```
 
 注意，这里的“表示”不是一定要把张量变小。这个例子反而增加了通道数，它要做的是**把棋盘编码转换成后续网络适合使用的特征**。
@@ -95,34 +112,25 @@ $$
 动作要先变成张量。比如五子棋中的动作是“在第 4 行、第 7 列落子”（下标从 0 开始），可以编码成一张只有落子位置为 `1`、其余位置为 `0` 的特征图：
 
 ```python
-action_plane = zeros(B, 1, 15, 15)
+action_plane = zeros(B, 1, 9, 9)
 action_plane[:, 0, 4, 7] = 1        # 此处假设这一批都演示相同动作
 
 # 沿通道维拼接，不是把两个张量相加
 x = cat([hidden_state, action_plane], dim=1)
-# [B, 128, 15, 15] 与 [B, 1, 15, 15] 拼接 → [B, 129, 15, 15]
+# [B, 32, 9, 9] 与 [B, 1, 9, 9] 拼接 → [B, 33, 9, 9]
 
 next_hidden_state = dynamics_body(x)
-# [B, 128, 15, 15]
+# [B, 32, 9, 9]
 ```
 
 对应的形状变化是：
 
-```text
-hidden state  [B, 128, 15, 15] ──┐
-                                 │
-动作编码       [B,   1, 15, 15] ──┴─ 沿通道拼接 → [B, 129, 15, 15]
-                                                         │
-                                                         ▼
-                                      3×3 卷积：129 → 128 个通道
-                                      stride=1, padding=1
-                                                        │
-                                                        ▼
-                                                   若干残差块
-                                                        │
-                                                        ▼
-                                          [B, 128, 15, 15]
-                                           next hidden state
+```mermaid
+flowchart LR
+    S["隐状态 sᵏ<br/>[B,32,9,9]"] --> C["沿通道拼接<br/>[B,33,9,9]"]
+    A["动作平面<br/>[B,1,9,9]"] --> C
+    C --> G["Dynamics 网络"]
+    G --> N["下一隐状态 sᵏ⁺¹<br/>[B,32,9,9]"]
 ```
 
 Dynamics 只接收隐状态和动作，不额外输入 `to_play` 平面，与论文描述一致。根观测仍编码当前玩家，$h$ 将其纳入隐状态；$g$ 通过训练学习保留和更新玩家信息。搜索节点保留 `to_play` 作为视角元数据，实际对局和价值回传继续遵循交替玩家约定。真实棋局终止也不意味着隐状态停止变化。[原论文，附录 E](https://arxiv.org/html/1911.08265v2#A5)
@@ -130,13 +138,13 @@ Dynamics 只接收隐状态和动作，不额外输入 `to_play` 平面，与论
 输入和输出的隐状态形状相同，因此可以连续调用**同一个 dynamics 网络**：
 
 ```python
-s0 = representation_network(observation_t)
-s1 = dynamics_network(s0, action_t)
-s2 = dynamics_network(s1, action_t_plus_1)
-s3 = dynamics_network(s2, action_t_plus_2)
+s0 = model.representation(observation_t)
+s1 = model.dynamics(s0, action_t)
+s2 = model.dynamics(s1, action_t_plus_1)
+s3 = model.dynamics(s2, action_t_plus_2)
 ```
 
-`s1`、`s2`、`s3` 都是 `[B, 128, 15, 15]`，但内容不同，分别表示模拟 1、2、3 步后的局面特征。**这里没有先还原成棋盘，也没有重新调用 representation。**
+`s1`、`s2`、`s3` 都是 `[B, 32, 9, 9]`，但内容不同，分别表示模拟 1、2、3 步后的局面特征。**这里没有先还原成棋盘，也没有重新调用 representation。**
 
 动作通道数取决于游戏。落子游戏可以用一个位置通道；移动棋子的游戏还要表达起点、终点、升变等信息。一般写成：`[B, C + C_action, H, W] → [B, C, H, W]`。
 
@@ -149,42 +157,33 @@ p^k, v^k = f(s^k)
 $$
 
 ```python
-policy_logits, value = prediction_network(hidden_state)
+policy_logits, value = model.prediction(hidden_state)
 
-# hidden_state.shape  == [B, 128, 15, 15]
-# policy_logits.shape == [B, 225]
-# value.shape         == [B, 1]
+# hidden_state.shape  == [B, 32, 9, 9]
+# policy_logits.shape == [B, 81]
+# value.shape         == [B]
 ```
 
-一种便于理解的双头结构如下；中间层宽度只是示例，图中省略中间激活函数：
+$f$ 从 hidden state 出发，分成 PolicyHead 和 ValueHead 两条支路；两个 head 内部的具体层本文不展开：
 
-```text
-                         hidden state [B, 128, 15, 15]
-                                      │
-                   ┌──────────────────┴──────────────────┐
-                   ▼                                     ▼
-             Policy head                            Value head
-        1×1 卷积：128 → 2                       1×1 卷积：128 → 1
-          [B, 2, 15, 15]                          [B, 1, 15, 15]
-                   │                                     │
-                flatten                               flatten
-               [B, 450]                              [B, 225]
-                   │                                     │
-           全连接：450 → 225                  全连接：225 → 128 → 1
-                   │                                     │
-        policy_logits [B, 225]                     tanh → [B, 1]
+```mermaid
+flowchart TB
+    S["隐状态<br/>[B,32,9,9]"] --> P["PolicyHead"]
+    S --> V["ValueHead"]
+    P --> L["策略 logits<br/>[B,81]"]
+    V --> T["价值<br/>[B]"]
 ```
 
-- **Policy**：225 个动作各有一个 logit，经过 softmax 后得到先验概率。动作编号 `row * 15 + col` 对应一个落子位置。网络始终输出完整的 225 项，不在 hidden state 上判断哪个位置可以落子。
+- **Policy**：81 个动作各有一个 logit，经过 softmax 后得到先验概率。动作编号 `row * 9 + col` 对应一个落子位置。网络始终输出完整的 81 项，不在 hidden state 上判断哪个位置可以落子。
 - **Value**：每个局面一个标量，表示当前玩家的预期胜负，范围为 `[-1, 1]`。
 
 这三个模块的输入输出可以放在一起看：
 
 | 模块 | 输入 | 输出 |
 |---|---|---|
-| Representation $h$ | 棋局编码 `[B, 3, 15, 15]` | 隐状态 `[B, 128, 15, 15]` |
-| Dynamics $g$ | 隐状态与动作编码拼接后 `[B, 129, 15, 15]` | 下一隐状态 `[B, 128, 15, 15]` |
-| Prediction $f$ | 隐状态 `[B, 128, 15, 15]` | 策略 logits `[B, 225]`、价值 `[B, 1]` |
+| Representation $h$ | 棋局编码 `[B, 3, 9, 9]` | 隐状态 `[B, 32, 9, 9]` |
+| Dynamics $g$ | 隐状态与动作编码拼接后 `[B, 33, 9, 9]` | 下一隐状态 `[B, 32, 9, 9]` |
+| Prediction $f$ | 隐状态 `[B, 32, 9, 9]` | 策略 logits `[B, 81]`、价值 `[B]` |
 
 ## MuZero 搜索算法流程
 
@@ -194,36 +193,36 @@ policy_logits, value = prediction_network(hidden_state)
 
 ```python
 # 根节点：手里有真实棋局，所以调用 h
-root.hidden_state = representation_network(observation)
+root.hidden_state = representation(observation)
 
 # 后续节点：搜索假设动作的结果，所以调用 g
-child.hidden_state = dynamics_network(parent.hidden_state, action)
+child.hidden_state = dynamics(parent.hidden_state, action)
 
 # 两种节点都用 f 预测策略和价值
-policy_logits, value = prediction_network(node.hidden_state)
+policy_logits, value = prediction(node.hidden_state)
 ```
 
-下面是突出主流程的伪代码，探索系数采用 MuZero 官方伪代码中随父节点访问次数增长的形式，省略批量推理等工程细节。搜索时将网络的 batch 维取出，policy 按动作编号索引，value 作为标量使用。`Node` 默认 `n=0`、`v=0`、`children={}`，其中 `v` 存储累计价值，`is_expanded()` 表示已经创建子节点。
+下面是突出主流程的伪代码，探索系数采用 MuZero 官方伪代码中随父节点访问次数增长的形式，省略批量推理等工程细节。搜索时将网络的 batch 维取出，policy 按动作编号索引，value 作为标量使用。`Node` 默认 `visits=0`、`value_sum=0`、`hidden_state=None`、`children=[]`。`children` 是子节点列表，每个子节点用 `action_taken` 记录对应动作；`value_sum` 存储累计价值，`q_value()` 返回平均价值（未访问时为 0）。下文的 `representation()`、`dynamics()`、`prediction()` 对应 MCTS 中的推理封装，负责张量转换和 batch 维处理，内部调用前面的三个网络模块。
 
 ### 1、选择
 
 从根节点开始，选择 PUCT 最大的子节点，直到到达一个未展开的节点：
 
 ```python
-while node.is_expanded():
+while node.children:
     node = select(node)
 
 
 def select(node):
-    return max(node.children.values(), key=get_puct)
+    return max(node.children, key=get_puct)
 
 
 def get_puct(node, pb_c_base=19652, pb_c_init=1.25):
-    # node.v / node.n 是子节点玩家的价值；对父节点玩家要取反
-    q = -node.v / node.n if node.n > 0 else 0
-    value_score = (q + 1) / 2 if node.n > 0 else 0
-    pb_c = log((node.parent.n + pb_c_base + 1) / pb_c_base) + pb_c_init
-    u = pb_c * sqrt(node.parent.n) * node.prior / (1 + node.n)
+    # node.value_sum / node.visits 是子节点玩家的价值；对父节点玩家要取反
+    q = -node.value_sum / node.visits if node.visits > 0 else 0
+    value_score = (q + 1) / 2 if node.visits > 0 else 0
+    pb_c = log((node.parent.visits + pb_c_base + 1) / pb_c_base) + pb_c_init
+    u = pb_c * sqrt(node.parent.visits) * node.prior / (1 + node.visits)
     return value_score + u
 ```
 
@@ -233,39 +232,35 @@ def get_puct(node, pb_c_base=19652, pb_c_init=1.25):
 
 ### 2、扩展
 
-这里讲的是 **dynamics 生成的树内节点**：prediction 对完整动作空间输出概率，直接据此创建子节点。整个过程没有合法动作查询，也没有 `mask_logits`。
+这里讲的是 **dynamics 生成的树内节点**：prediction 对完整动作空间输出概率，直接据此创建子节点。整个过程没有合法动作查询，也没有 `mask_illegal_actions()`。
 
 ```python
 # 先得到当前节点的隐状态
-node.hidden_state = dynamics_network(
+node.hidden_state = dynamics(
     node.parent.hidden_state,
     node.action_taken
 )
 
-# 再预测策略、创建子节点，并返回当前节点的价值
-value = expand(node)
+# 再预测策略和当前节点的价值，并创建子节点
+policy_logits, value = prediction(node.hidden_state)
+expand(node, softmax(policy_logits))
 
 
-def expand(node):
-    policy_logits, value = prediction_network(node.hidden_state)
-    policy = softmax(policy_logits)
-
+def expand(node, policy):
     # 树内节点按完整动作空间展开，不使用真实棋盘的合法动作集合
-    for action in range(action_space_size):
-        node.children[action] = Node(
-            hidden_state=None,          # 真正搜索到这里时，才调用 dynamics
+    for action in range(game.board_size ** 2):
+        child = Node(  # 真正搜索到这里时，才调用 dynamics
             to_play=-node.to_play,
             prior=policy[action],
             parent=node,
             action_taken=action
         )
-
-    return value
+        node.children.append(child)
 ```
 
 **隐状态搜索与真实落子的区别**
 
-在隐状态搜索中，每个动作仍对应固定的动作编号。例如 `action = 67` 仍表示尝试在第 4 行、第 7 列落子。`g(hidden_state, 67)` 只进行网络计算，不检查这个位置在真实棋盘上是否已经有棋子。
+在隐状态搜索中，每个动作仍对应固定的动作编号。例如 `action = 43` 仍表示尝试在第 4 行、第 7 列落子。`g(hidden_state, 43)` 只进行网络计算，不检查这个位置在真实棋盘上是否已经有棋子。
 
 所以准确地说，**树内没有显式的合法性判断和屏蔽步骤**。真实游戏的规则仍然存在，只是没有被拿来筛选树内节点的动作。内部 policy 通过训练学习动作的先验概率，搜索再结合预测价值进行选择。
 
@@ -282,96 +277,111 @@ def expand(node):
 ```python
 def backpropagate(node, value):
     while node is not None:
-        node.v += value
-        node.n += 1
+        node.value_sum += value
+        node.visits += 1
         value = -value
         node = node.parent
 ```
 
 ### 完整搜索与最终策略
 
-把根节点初始化单独写成 `expand_root()`：只有这个函数从真实棋盘获取合法动作，并屏蔽对应 logits；模拟循环中的 `expand()` 始终使用上面的完整动作空间。
+为了讲解方便，将代码中根节点初始化的部分单独写成 `expand_root()`：只有这个函数从真实棋盘获取合法动作，并屏蔽对应 logits；模拟循环中的 `expand()` 始终使用上面的完整动作空间。
 
 ```python
 def expand_root(root, real_state, add_dirichlet=False):
-    policy_logits, value = prediction_network(root.hidden_state)
+    policy_logits, value = prediction(root.hidden_state)
 
     # 这是环境对当前真实棋盘的判断，不是隐状态上的规则推演
-    legal_actions = game.get_legal_actions(real_state)
-    policy_logits = mask_logits(policy_logits, legal_actions)
+    legal_actions_mask = game.get_legal_action_mask(real_state, root.to_play)
+    policy_logits = game.mask_illegal_actions(real_state, root.to_play, policy_logits)
     # 将非法位置设为 -inf，再做 softmax
     policy = softmax(policy_logits)
 
     if add_dirichlet:
-        policy = mix_dirichlet(policy, legal_actions)
+        policy = add_dirichlet_noise(
+            policy,
+            total_concentration=0.03 * game.board_size ** 2,
+            legal_actions_mask=legal_actions_mask,
+            noise_weight=0.25
+        )
 
-    for action in legal_actions:
-        root.children[action] = Node(
-            hidden_state=None,
+    for action in np.flatnonzero(legal_actions_mask):
+        child = Node(
             to_play=-root.to_play,
             prior=policy[action],
             parent=root,
-            action_taken=action
+            action_taken=int(action)
         )
+        root.children.append(child)
 
     return value
 
 
-@no_grad()  # 搜索收集统计量，不构建训练用的梯度图
-def search(state, to_play, self_play=True):
+@torch.inference_mode()  # 搜索收集统计量，不构建训练用的梯度图
+def search(state, to_play, num_simulations):
     observation = game.encode_state(state, to_play)
 
-    root = Node(
-        hidden_state=representation_network(observation),
-        to_play=to_play,
-        parent=None
-    )
+    root = Node(to_play)
+    root.hidden_state = representation(observation)
 
-    expand_root(
+    value = expand_root(
         root,
         real_state=state,
-        add_dirichlet=self_play
+        add_dirichlet=args.get("mode", "train") == "train"
     )
+    backpropagate(root, value)
 
     for _ in range(num_simulations):
         node = root
 
         # 1. 选择
-        while node.is_expanded():
+        while node.children:
             node = select(node)
 
         # 2. 扩展：这里只计算 hidden state，不推演真实棋盘
-        node.hidden_state = dynamics_network(
+        node.hidden_state = dynamics(
             node.parent.hidden_state,
             node.action_taken
         )
-        value = expand(node)
+        policy_logits, value = prediction(node.hidden_state)
+        expand(node, softmax(policy_logits))
 
         # 3. 回传搜索价值
         backpropagate(node, value)
 
     # 访问次数分布作为 policy 训练目标
-    mcts_policy = zeros(action_space_size)
-    for action, child in root.children.items():
-        mcts_policy[action] = child.n
+    mcts_policy = np.zeros(game.board_size ** 2)
+    for child in root.children:
+        mcts_policy[child.action_taken] = child.visits
     mcts_policy /= sum(mcts_policy)
 
-    # 评估时选择访问次数最多的动作
-    best_action = max(root.children, key=lambda a: root.children[a].n)
-    return mcts_policy, best_action
+    return mcts_policy, root.q_value()
 ```
 
-上面假设输入棋局尚未结束、至少有一个合法动作，且 `num_simulations > 0`。自对弈时可按访问次数分布采样动作，增加探索；评估时选择访问次数最多的动作。
+**根节点在模拟前也回传一次自身的网络价值**，因此第一次选择时根访问次数为 1，探索项能够按先验概率区分动作。这次根评估不计入 `num_simulations`；完成 N 次模拟后，根访问次数为 N+1，根子节点访问次数之和为 N。
+
+搜索返回访问次数分布与根节点平均价值，动作由调用方决定。评估时选择访问次数最多的动作：
+
+```python
+# 评估时选择访问次数最多的动作
+mcts_policy, root_value = search(state, to_play, num_simulations)
+action = int(np.argmax(mcts_policy))
+```
+
+上面假设输入棋局尚未结束、至少有一个合法动作，且 `num_simulations > 0`。
 
 ## 自对弈数据：训练目标从哪里来？
 
-每次完成搜索后，**在真实环境中实际走一步**，保存这一时刻的数据：
+每局从空的 `memory` 开始。每次完成搜索后，**在真实环境中实际走一步**，保存这一时刻的数据。代码在步数小于 `half_life` 时按访问次数分布采样，之后取最大值；`half_life` 默认等于棋盘边长。无论怎样选择动作，保存的策略目标始终是完整的访问次数分布：
 
 ```python
-mcts_policy, best_action = search(state, to_play)
-action = sample(mcts_policy)
+mcts_policy, _ = search(state, to_play, num_simulations)
+if len(memory) + 1 < half_life:
+    action = int(np.random.choice(len(mcts_policy), p=mcts_policy))
+else:
+    action = int(np.argmax(mcts_policy))
 
-history.append({
+memory.append({
     "observation": game.encode_state(state, to_play),
     "player": to_play,
     "action": action,
@@ -386,12 +396,12 @@ to_play = -to_play
 一局结束后，把最终结果转换成各个时刻玩家的相对胜负：
 
 ```python
-winner = game.get_winner(state)     # 黑胜 +1，白胜 -1，和棋 0
+winner = game.get_winner(state, to_play)     # 黑胜 +1，白胜 -1，和棋 0
 
-for item in history:
-    item["value_target"] = winner * item["player"]
+for step in memory:
+    step["value_target"] = winner * step["player"]
 
-replay_buffer.add(history)
+replay_buffer.add_game(memory)
 ```
 
 因此每个真实时刻 $j$ 都有两个监督目标：
@@ -417,31 +427,41 @@ replay_buffer.add(history)
 训练时只把起点 `o_t` 交给 representation，然后把这局棋**实际走过的动作**依次交给 dynamics：
 
 ```python
-s0 = representation_network(observation_t)
-p0, v0 = prediction_network(s0)
+s0 = model.representation(observation_t)
+p0, v0 = model.prediction(s0)
 
-s1 = dynamics_network(s0, action_t)
-p1, v1 = prediction_network(s1)
+s1 = model.dynamics(s0, action_t)
+p1, v1 = model.prediction(s1)
 
-s2 = dynamics_network(s1, action_t_plus_1)
-p2, v2 = prediction_network(s2)
+s2 = model.dynamics(s1, action_t_plus_1)
+p2, v2 = model.prediction(s2)
 ```
 
 对应关系是：
 
-```text
-o_t ── h ──> s0 ── g(·, a_t) ──> s1 ── g(·, a_{t+1}) ──> s2
-              │                    │                       │
-              f                    f                       f
-              │                    │                       │
-              ▼                    ▼                       ▼
-           p0, v0               p1, v1                  p2, v2
-              │                    │                       │
-           对照目标             对照目标                对照目标
-              │                    │                       │
-              ▼                    ▼                       ▼
-          π_t, +1             π_{t+1}, -1             π_{t+2}, +1
+```mermaid
+flowchart LR
+    O["起点观测 oₜ"] --> H["h"] --> S0["s⁰"]
+    S0 --> G1["g"] --> S1["s¹"]
+    S1 --> G2["g"] --> S2["s²"]
+    A0["实际动作 aₜ"] --> G1
+    A1["实际动作 aₜ₊₁"] --> G2
+    S0 --> F0["f"] --> P0["p⁰, v⁰"]
+    S1 --> F1["f"] --> P1["p¹, v¹"]
+    S2 --> F2["f"] --> P2["p², v²"]
+    P0 -. 对照目标 .-> T0["πₜ, +1"]
+    P1 -. 对照目标 .-> T1["πₜ₊₁, −1"]
+    P2 -. 对照目标 .-> T2["πₜ₊₂, +1"]
+
+    classDef representation fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef dynamics fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef prediction fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    class H representation
+    class G1,G2 dynamics
+    class F0,F1,F2 prediction
 ```
+
+两个 $g$ 共享参数，三个 $f$ 也共享参数。每一步的预测分别对照真实轨迹中对应时刻的目标。
 
 特别注意：`p1` 对应的是 **下一真实棋局重新进行 MCTS 后得到的 `π_{t+1}`**，不是起点 `π_t`，也不是起点搜索树中某个内部节点的访问分布。
 
@@ -459,7 +479,7 @@ loss1 = policy_loss(p1, target_policy_t_plus_1)
 loss1 += value_loss(v1, target_value_t_plus_1)
 
 # 基础 MuZero 不要求添加这样的 hidden state 对齐损失：
-# mse(s1, representation_network(observation_t_plus_1))
+# mse(s1, model.representation(observation_t_plus_1))
 ```
 
 因此，`g(h(o_t), a_t)` 与 `h(o_{t+1})` **形状相同，但数值不必逐元素相等**。前者由模型模拟一步得到，后者由真实下一棋局重新编码得到；训练要求它们支持正确的预测，没有要求它们内部表示完全一样。
@@ -516,10 +536,9 @@ $$
 
 $$
 L = \sum_{k=0}^{K}\left(L_{policy}^{k}+L_{value}^{k}\right)
-    + \lambda\|\theta\|^2
 $$
 
-这里 $\theta$ 包含 $h$、$g$、$f$ 的所有参数。下面用 PyTorch 风格伪代码写出一次更新，先演示没有跨过终局的片段；实际 batch 的有效步数和终局处理见后文。
+这里按默认的 policy/value 等权设置书写；代码还支持用 `value_loss_scale` 调整 value 权重。权重衰减由 AdamW 优化器处理，不作为显式损失项加入上式。下面用 PyTorch 风格伪代码写出一次更新。`sample` 表示整理为 batch 张量后的数据，`policy_mask` 标记该步是否有真实 MCTS 策略；终局处理见后文。
 
 ```python
 # 与实现共用：前向保持数值，反向按指定比例传递梯度
@@ -531,22 +550,23 @@ optimizer.zero_grad()
 
 # sample.observation:   [B, C_in, H, W]，只有起点的棋局输入
 # sample.actions:       [B, K]，自对弈中实际执行的 K 个动作
-# sample.target_policy: [B, K+1, A]，各真实时刻的 MCTS 分布
-# sample.target_value:  [B, K+1, 1]，各时刻玩家视角下的最终胜负
+# sample.policy_targets: [B, K+1, A]，各真实时刻的 MCTS 分布
+# sample.value_targets:  [B, K+1]，各时刻玩家视角下的最终胜负
 
-hidden_state = representation_network(sample.observation)
+hidden_state = model.representation(sample.observation)
 loss = 0.0
 
 for k in range(K + 1):
-    policy_logits, value = prediction_network(hidden_state)
+    policy_logits, value = model.prediction(hidden_state)
 
     # 策略目标是完整概率分布，而不是某个动作编号
     policy_loss = -(
-        sample.target_policy[:, k] * log_softmax(policy_logits, dim=-1)
-    ).sum(dim=-1).mean()
+        sample.policy_targets[:, k] * log_softmax(policy_logits, dim=-1)
+    ).sum(dim=-1)
+    policy_loss = (sample.policy_mask[:, k] * policy_loss).mean()
 
     value_loss = (
-        value - sample.target_value[:, k]
+        value - sample.value_targets[:, k]
     ).square().mean()
 
     gradient_scale = 1.0 if k == 0 else 1.0 / K
@@ -557,7 +577,7 @@ for k in range(K + 1):
         if k > 0:
             hidden_state = scale_gradient(hidden_state, 0.5)
         # 动作编码与通道拼接在 dynamics 内部完成
-        hidden_state = dynamics_network(
+        hidden_state = model.dynamics(
             hidden_state,
             sample.actions[:, k]
         )
@@ -579,14 +599,14 @@ optimizer.step()
 
 ### 5、展开到终局怎么办？
 
-前面的训练代码只展示了尚未结束的片段。完整实现还要处理“剩余实际步数不足 $K$”以及“模型继续推演到终局之后”的情况，不能读取不存在的下一步 MCTS 策略。
+训练片段可能跨过终局，需要处理“剩余实际步数不足 $K$”以及“模型继续推演到终局之后”的情况，不能读取不存在的下一步 MCTS 策略。
 
 原版 MuZero 使用**吸收状态**的思路：真实棋局结束后，结果不再改变，让模型在继续展开时也保持与这个结果一致的预测。[原论文，附录 A](https://arxiv.org/html/1911.08265v2#A1)
 
-对本文的“无 reward 分支、value 表示最终胜负”的约定，一种具体处理方式是：
+对本文的“无 reward 分支、value 表示最终胜负”的约定，本项目采用以下处理：
 
-- 终局前使用实际动作、MCTS 策略和最终胜负。
-- 终局以及补齐的后续步骤不再有真实 MCTS 策略，屏蔽这些步骤的 policy loss；补齐动作从固定动作空间取值。
+- 终局前使用实际动作、MCTS 策略和最终胜负，`policy_mask=1`。
+- 终局以及补齐的后续步骤不再有真实 MCTS 策略，令 `policy_mask=0`，屏蔽这些步骤的 policy loss；补齐动作从固定动作空间取值。
 - value 仍以固定的最终结果为目标，并转换到该步的玩家视角。如果沿用代码中每步切换玩家的约定，黑胜对应的目标仍按 `+1, -1, +1, ...` 交替；改变的是视角，不是比赛结果。
 - 补齐动作在回放中固定为 `0`，数据增强时随棋盘一起重映射；隐状态仍会经 $g$ 更新，玩家信息由隐状态携带。
 
@@ -601,7 +621,7 @@ r^{k+1}, s^{k+1} = g(s^k, a_{t+k})
 $$
 
 ```python
-reward, next_hidden_state = dynamics_network(hidden_state, action)
+reward, next_hidden_state = model.dynamics(hidden_state, action)
 
 # reward.shape            == [B, 1]，此处用标量回归演示
 # next_hidden_state.shape == [B, C, H, W]
@@ -618,7 +638,7 @@ hidden state + action → dynamics 特征 → next hidden state [B, C, H, W]
 此时自对弈还需要保存环境反馈的真实奖励 `u_{t+1}`。训练每次调用 dynamics 后，多加一项：
 
 ```python
-reward, hidden_state = dynamics_network(hidden_state, sample.actions[:, k])
+reward, hidden_state = model.dynamics(hidden_state, sample.actions[:, k])
 loss += reward_loss(reward, sample.target_reward[:, k])
 # target_reward[:, k] 保存执行 a_{t+k} 后得到的 u_{t+k+1}
 ```
@@ -628,7 +648,6 @@ loss += reward_loss(reward, sample.target_reward[:, k])
 $$
 L = \sum_{k=0}^{K}\left(L_{policy}^{k}+L_{value}^{k}\right)
     + \sum_{k=1}^{K}L_{reward}^{k}
-    + \lambda\|\theta\|^2
 $$
 
 注意 reward loss 从 `k=1` 开始：起点还没经过动作，不存在这一展开链中的第 0 步奖励预测。
