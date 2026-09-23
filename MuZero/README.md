@@ -1,6 +1,6 @@
 # MuZero
 
-用 Python、NumPy 和 PyTorch 实现 MuZero：搜索树里的节点保存**学习的隐状态**，节点之间的转移由**动力学网络**计算，而不是用真实规则算出下一棋盘。支持井字棋和自由规则五子棋，串行自我对弈。
+用 Python、NumPy 和 PyTorch 实现 MuZero：搜索树里的节点保存**学习的隐状态**，节点之间的转移由**动力学网络**计算，而不是用真实规则算出下一棋盘。支持井字棋和自由规则五子棋，提供串行与批量推理并行两种自我对弈后端。
 
 三个网络的分工、隐状态 MCTS 的流程、以及 K 步展开的训练目标见 [MuZero 技巧](../docs/MuZero.md)。
 
@@ -38,6 +38,7 @@ python -m pytest tests/ -q
 | [井字棋环境](envs/tictactoe.py)、[五子棋环境](envs/gomoku.py) | 状态、合法动作、落子、胜负与网络输入编码 |
 | [network.py](alphazero/network.py) | 三个模块：Representation `h`、Dynamics `g`、Prediction `f` |
 | [mcts.py](alphazero/mcts.py) | 隐状态 MCTS：根用 `h`+`f` 并对真实棋盘屏蔽合法动作，树内用 `g`+`f` 按完整动作空间展开 |
+| [alphazero_parallel.py](alphazero/alphazero_parallel.py) | 并行自我对弈：跨对局合并 batch，两段式推理（先 `h`/`g` 再 `f`） |
 | [replay_buffer.py](alphazero/replay_buffer.py) | 整局历史、窗口裁剪、按起点构造 K 步展开样本 |
 | [trainer.py](alphazero/trainer.py) | 自我对弈、K 步展开训练、损失与 checkpoint |
 | [utils.py](alphazero/utils.py) | Dirichlet 噪声、含动作重映射的棋盘对称增强、设备选择与棋盘显示 |
@@ -53,7 +54,7 @@ python -m pytest tests/ -q
 
 ## 当前行为与边界
 
-- 目前只有**串行**自我对弈；尚未提供批量推理的并行后端，也没有串行/并行等价性测试。
+- 自我对弈默认走**并行**后端（跨对局把待评估节点合并成 batch 推理，`parallel=False` 退回串行）；`num_parallel_games` 控制同时活跃的对局数，默认 32。`num_parallel_games=1` 时并行后端与串行逐位一致，见 [tests/test_parallel.py](tests/test_parallel.py) 的等价性测试。
 - 隐状态搜索中，树内节点按**完整动作空间**展开，不查询真实棋盘的合法动作，也不在树内判断终局；只有根节点用环境给出的合法动作屏蔽先验。真实规则仍用于推进实际对局和判定胜负。
 - 按 [MuZero.md](../docs/MuZero.md) 的棋类约定，**省略 reward 分支**：value 直接学习最终胜负（标量 `tanh`，不是胜/平/负三分类），训练时终局之后的步屏蔽 policy loss、value 目标按交替视角沿用最终胜负。
 - 训练沿 `h → g → g → …` 展开 K 步，K+1 组 policy/value 损失的梯度同时更新 `h`、`g`、`f`。

@@ -18,6 +18,7 @@ def tiny_args(tmp_path):
         "num_channels": 8,
         "dirichlet_total_concentration": 0.03 * 3 ** 2,
         "dirichlet_noise_weight": 0.25,
+        "parallel": False,
         "unroll_steps": 3,
         "num_iterations": 2,
         "train_steps": 2,
@@ -77,7 +78,10 @@ class TestCheckpoint:
             mz.replay_buffer.add_game(mz.selfplay()[0])
             mz.train_step()
         mz.metrics.record_game(1, 1, 5, 0)
-        mz.metrics.record_losses(1.0, 0.6, 0.4)
+        mz.metrics.record_losses(
+            1.0, 0.6, 0.4, [0.5, 0.4, 0.3, 0.2],
+            {"representation": 1.0, "dynamics": 2.0, "prediction": 3.0},
+        )
         mz.scheduler.record_iteration(games_played=2, rows_produced=12)
         mz.scheduler.games_to_order(total_rows_produced=12)
 

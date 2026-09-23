@@ -5,16 +5,29 @@ from .plots import render_training, write_metrics_csv
 
 class MetricsTracker:
     def __init__(self):
-        self.losses = {"total": [], "policy": [], "value": []}
+        self.losses = {
+            "total": [],
+            "policy": [],
+            "value": [],
+            "step_losses": [],
+            "grad_representation": [],
+            "grad_dynamics": [],
+            "grad_prediction": [],
+        }
         self.game_records = []
 
     def record_game(self, game_index, winner, length, iteration):
         self.game_records.append((game_index, winner, length, iteration))
 
-    def record_losses(self, total, policy, value):
+    def record_losses(self, total, policy, value, step_losses=None, grad_norms=None):
         self.losses["total"].append(total)
         self.losses["policy"].append(policy)
         self.losses["value"].append(value)
+        self.losses["step_losses"].append(list(step_losses) if step_losses else [])
+        grad_norms = grad_norms or {}
+        self.losses["grad_representation"].append(grad_norms.get("representation", float("nan")))
+        self.losses["grad_dynamics"].append(grad_norms.get("dynamics", float("nan")))
+        self.losses["grad_prediction"].append(grad_norms.get("prediction", float("nan")))
 
     @staticmethod
     def winrate_summary(winners):

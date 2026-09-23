@@ -10,6 +10,7 @@ from tqdm import tqdm
 from .mcts import MCTS
 from .metrics import MetricsTracker
 from .network import MuZeroNet
+from .alphazero_parallel import ParallelSelfPlayer
 from .replay_buffer import ReplayBuffer
 from .scheduler import SelfPlayScheduler
 from .utils import auto_device, random_augment_batch
@@ -76,9 +77,9 @@ class Reporter:
         if done % every and done != total:
             return
         dt = max(1e-9, time.time() - t0)
-        sps = stats.rows / dt
+        rows_per_s = stats.rows / dt
         gw = max(2, len(str(total)))
-        head = f"[SelfPlay] Iter={i} Games={done:0{gw}d}/{total} Sps={sps:.1f}"
+        head = f"[SelfPlay] Iter={i} Games={done:0{gw}d}/{total} Rows/s={rows_per_s:.1f}"
         if stats.game_lens:
             arr = np.asarray(stats.game_lens, dtype=np.float64)
             black, draw, white = MetricsTracker.winrate_summary(stats.winners)
@@ -149,6 +150,14 @@ class Reporter:
         print("\nStopping... saving final checkpoint and plots", flush=True)
 
 
+def _module_grad_norm(module):
+    total = 0.0
+    for parameter in module.parameters():
+        if parameter.grad is not None:
+            total += float(parameter.grad.detach().pow(2).sum())
+    return total ** 0.5
+
+
 class MuZero:
     def __init__(self, game, args):
         self.game = game
@@ -166,6 +175,11 @@ class MuZero:
             weight_decay=args.get("weight_decay", 3e-4),
         )
         self.mcts = MCTS(game, args, self.model, self.device)
+        self.parallel_player = (
+            ParallelSelfPlayer(game, args, self.model, self.device)
+            if args.get("parallel", True)
+            else None
+        )
         self.replay_buffer = ReplayBuffer(
             min_rows=args.get("min_rows", 30000),
             taper_window_exponent=args.get("taper_window_exponent", 0.675),
@@ -250,31 +264,47 @@ class MuZero:
             np.array([s["policy_mask"] for s in batch]), dtype=torch.float32, device=self.device
         )
 
+        batch_size = observations.shape[0]
         self.model.train()
         self.optimizer.zero_grad()
 
         hidden_state = self.model.representation(observations)
         policy_loss = 0.0
         value_loss = 0.0
+        step_losses = []
         for k in range(unroll_steps + 1):
             policy_logits, value = self.model.prediction(hidden_state)
             step_policy = -torch.sum(
                 policy_targets[:, k] * F.log_softmax(policy_logits, dim=1), dim=1
             )
-            policy_loss = policy_loss + torch.sum(policy_mask[:, k] * step_policy)
-            value_loss = value_loss + F.mse_loss(value, value_targets[:, k], reduction="sum")
+            policy_term = torch.sum(policy_mask[:, k] * step_policy)
+            value_term = F.mse_loss(value, value_targets[:, k], reduction="sum")
+            policy_loss = policy_loss + policy_term
+            value_loss = value_loss + value_term
+            step_losses.append(((policy_term + value_term) / batch_size).item())
             if k < unroll_steps:
                 hidden_state = self.model.dynamics(hidden_state, actions[:, k])
 
-        denominator = observations.shape[0] * (unroll_steps + 1)
+        denominator = batch_size * (unroll_steps + 1)
         policy_loss = policy_loss / denominator
         value_loss = value_loss / denominator
         total_loss = policy_loss + self.args.get("value_loss_scale", 1.0) * value_loss
 
         total_loss.backward()
+        grad_norms = {
+            "representation": _module_grad_norm(self.model.representation),
+            "dynamics": _module_grad_norm(self.model.dynamics),
+            "prediction": _module_grad_norm(self.model.prediction),
+        }
         self.optimizer.step()
         self.model.eval()
-        return total_loss.item(), policy_loss.item(), value_loss.item()
+        return {
+            "total": total_loss.item(),
+            "policy": policy_loss.item(),
+            "value": value_loss.item(),
+            "step_losses": step_losses,
+            "grad_norms": grad_norms,
+        }
 
     # -- learn loop -------------------------------------------------------
 
@@ -327,7 +357,10 @@ class MuZero:
         return stats
 
     def _selfplay_games(self, games):
-        """Yield (game, winner, game_len) per game, 串行实现。"""
+        """Yield (game, winner, game_len) per game, 串行或并行后端二选一。"""
+        if self.parallel_player is not None:
+            yield from self.parallel_player.run(games)
+            return
         for _ in range(games):
             yield self.selfplay()
 
@@ -342,27 +375,33 @@ class MuZero:
 
         train_steps = self.args.get("train_steps", 200)
         t0 = time.time()
-        total_loss = policy_loss = value_loss = 0.0
+        totals = {"total": 0.0, "policy": 0.0, "value": 0.0}
+        step_losses_sum = []
+        grad_sums = {"representation": 0.0, "dynamics": 0.0, "prediction": 0.0}
         steps_done = 0
         try:
             for _ in self.reporter.train_progress(i, train_steps):
-                res = self.train_step()
-                if res:
-                    total_loss += res[0]
-                    policy_loss += res[1]
-                    value_loss += res[2]
-                    steps_done += 1
-                    self.reporter.train_step_done(steps_done, total_loss)
+                result = self.train_step()
+                if not result:
+                    continue
+                steps_done += 1
+                for key in totals:
+                    totals[key] += result[key]
+                if not step_losses_sum:
+                    step_losses_sum = [0.0] * len(result["step_losses"])
+                for index, value in enumerate(result["step_losses"]):
+                    step_losses_sum[index] += value
+                for key, value in result["grad_norms"].items():
+                    grad_sums[key] += value
+                self.reporter.train_step_done(steps_done, totals["total"])
         finally:
             self.reporter.train_progress_finished()
 
         if steps_done:
-            losses = (
-                total_loss / steps_done,
-                policy_loss / steps_done,
-                value_loss / steps_done,
-            )
-            self.metrics.record_losses(*losses)
+            losses = tuple(totals[key] / steps_done for key in ("total", "policy", "value"))
+            mean_step_losses = [value / steps_done for value in step_losses_sum]
+            mean_grads = {key: value / steps_done for key, value in grad_sums.items()}
+            self.metrics.record_losses(*losses, mean_step_losses, mean_grads)
             self.reporter.train_done(i, steps_done, time.time() - t0, *losses)
 
     # -- io ---------------------------------------------------------------

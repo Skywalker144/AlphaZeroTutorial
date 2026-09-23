@@ -77,9 +77,9 @@ class Reporter:
         if done % every and done != total:
             return
         dt = max(1e-9, time.time() - t0)
-        sps = stats.rows / dt
+        rows_per_s = stats.rows / dt
         gw = max(2, len(str(total)))
-        head = f"[SelfPlay] Iter={i} Games={done:0{gw}d}/{total} Sps={sps:.1f}"
+        head = f"[SelfPlay] Iter={i} Games={done:0{gw}d}/{total} Rows/s={rows_per_s:.1f}"
         if stats.game_lens:
             arr = np.asarray(stats.game_lens, dtype=np.float64)
             black, draw, white = MetricsTracker.winrate_summary(stats.winners)

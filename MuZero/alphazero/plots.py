@@ -148,11 +148,30 @@ def write_metrics_csv(out_dir, losses, game_records):
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "losses.csv"), "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["iteration", "total", "policy", "value"])
-        for index, (total, policy, value) in enumerate(
-            zip(losses["total"], losses["policy"], losses["value"])
-        ):
-            writer.writerow([index, total, policy, value])
+        writer.writerow(
+            [
+                "iteration", "total", "policy", "value",
+                "grad_representation", "grad_dynamics", "grad_prediction",
+            ]
+        )
+        for index in range(len(losses["total"])):
+            writer.writerow(
+                [
+                    index,
+                    losses["total"][index],
+                    losses["policy"][index],
+                    losses["value"][index],
+                    losses["grad_representation"][index],
+                    losses["grad_dynamics"][index],
+                    losses["grad_prediction"][index],
+                ]
+            )
+    with open(os.path.join(out_dir, "losses_by_step.csv"), "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["iteration", "step", "loss"])
+        for index, series in enumerate(losses["step_losses"]):
+            for step, value in enumerate(series):
+                writer.writerow([index, step, value])
     with open(os.path.join(out_dir, "games.csv"), "w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
@@ -166,7 +185,7 @@ def write_metrics_csv(out_dir, losses, game_records):
 
 def render_training(out_dir, losses, game_records):
     apply_theme()
-    figure, axes = plt.subplots(2, 2, figsize=(15.0, 9.5), layout="constrained")
+    figure, axes = plt.subplots(3, 2, figsize=(15.0, 13.5), layout="constrained")
     iterations = len(losses["total"])
     games = len(game_records)
     total_samples = int(sum(length for _, _, length, _ in game_records))
@@ -233,6 +252,51 @@ def render_training(out_dir, losses, game_records):
     axis.set_title("Loss components")
     axis.set_xlabel("Training iteration")
     axis.set_ylabel("Loss")
+    _style_axis(axis)
+
+    axis = axes[2, 0]
+    step_series = [series for series in losses.get("step_losses", []) if series]
+    if step_series:
+        width = min(len(series) for series in step_series)
+        matrix = np.array([series[:width] for series in step_series], dtype=np.float64)
+        steps = np.arange(width)
+        mean_curve = matrix.mean(axis=0)
+        axis.plot(steps, mean_curve, color=ORANGE, linewidth=1.8, label="Mean over iterations")
+        axis.plot(steps, matrix[-1], color=BLUE, linewidth=1.6, linestyle="--", label="Latest iteration")
+        _use_log_scale(axis, [mean_curve.tolist(), matrix[-1].tolist()])
+        axis.legend(fontsize=9)
+    else:
+        _empty_axis(axis, "No per-step losses recorded yet")
+    axis.set_title("Loss by unroll step")
+    axis.set_xlabel("Unroll step k  (k=0 updates h+f only)")
+    axis.set_ylabel("Loss per step")
+    _style_axis(axis)
+    if step_series:
+        axis.set_xticks(np.arange(min(len(series) for series in step_series)))
+
+    axis = axes[2, 1]
+    plotted = False
+    for key, color, label in (
+        ("grad_representation", BLUE, "Representation h"),
+        ("grad_dynamics", GREEN, "Dynamics g"),
+        ("grad_prediction", ORANGE, "Prediction f"),
+    ):
+        plotted |= _plot_loss_series(axis, losses.get(key, []), color, label)
+    if plotted:
+        _use_log_scale(
+            axis,
+            [
+                losses.get("grad_representation", []),
+                losses.get("grad_dynamics", []),
+                losses.get("grad_prediction", []),
+            ],
+        )
+        axis.legend(fontsize=9)
+    else:
+        _empty_axis(axis, "No gradient norms recorded yet")
+    axis.set_title("Gradient norms by module")
+    axis.set_xlabel("Training iteration")
+    axis.set_ylabel("Grad norm")
     _style_axis(axis)
 
     path = os.path.join(out_dir, "training.png")
