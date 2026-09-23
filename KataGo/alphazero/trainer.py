@@ -18,6 +18,7 @@ from .utils import (
     auto_device,
     chosen_move_temperature,
     finish_game_samples,
+    lcb_play_selection,
     policy_surprise,
     random_augment_batch,
     reduced_search_limit,
@@ -227,7 +228,7 @@ class AlphaZero:
                 num_simulations, weight = reduced_search_limit(
                     self.args, win_loss_history, full_simulations, cheap_simulations
                 )
-            mcts_policy, root_value, root = self.mcts.search(
+            raw_policy, root_value, root = self.mcts.search(
                 state, to_play,
                 num_simulations=num_simulations,
                 turn_number=turn_number,
@@ -235,13 +236,14 @@ class AlphaZero:
                 root=root if cheap else None,
             )
             win_loss_history.append(root_value * to_play)
+            target_policy = lcb_play_selection(root, self.game.board_size ** 2, self.args)
 
             memory.append({
                 "state": state,
                 "to_play": to_play,
-                "mcts_policy": mcts_policy,
+                "mcts_policy": target_policy,
                 "weight": weight,
-                "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
+                "policy_surprise": policy_surprise(root.prior_policy, target_policy),
                 "search_wdl": (root.wdl_sum / root.visits).copy(),
                 "nn_wdl": root.nn_wdl.copy(),
             })
@@ -250,7 +252,7 @@ class AlphaZero:
                 self.args, turn_number, self.game.board_size
             )
             action = np.random.choice(
-                len(mcts_policy), p=apply_temperature(mcts_policy, temperature)
+                len(raw_policy), p=apply_temperature(raw_policy, temperature)
             )
 
             root = self.mcts.advance(root, action)

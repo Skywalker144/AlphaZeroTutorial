@@ -13,6 +13,7 @@
 - [TreeReuse](#treereuse)
 - [WDLValueHead](#wdlvaluehead)
 - [FPU](#fpu)
+- [LCB](#lcb)
 - [RootTemperature / ChosenMoveTemperature](#roottemperature--chosenmovetemperature)
 - [ShapedDirichletNoise](#shapeddirichletnoise)
 - [SoftResign](#softresign)
@@ -27,6 +28,7 @@
 | TreeReuse | 落子后保留被选分支的子树，供下一步 reuse | 一致 |
 | WDLValueHead | value 输出胜/平/负三分类，交叉熵训练，搜索用 `P(胜) − P(负)` | 一致 |
 | FPU | 未访问子节点价值 = 父价值与网络价值的混合 − 缩减量 | 未实现 `fpuLossProp` |
+| LCB | 用「均值 − k·标准误」修正根节点的 policy target，避免选到虚高的着法 | 未实现 forced-playout pruning |
 | RootTemperature / ChosenMoveTemperature | 根策略温度 + 落子温度，随对局进度衰减 | 一致 |
 | ShapedDirichletNoise | alpha 一半均匀、一半按 `log(先验)` 形状 | 先验封顶按棋盘面积缩放 |
 | SoftResign | 一边倒时降低 full search 的访问数与样本权重，仍下到真实终局 | `reduced_visits_min` 取 cheap 访问数 |
@@ -186,6 +188,69 @@ $$
 ### 实验与结论
 
 本仓库暂无受控实验。可预期的效果是早期搜索更集中、更少「每个着法各访问一次」。
+
+---
+
+## LCB
+
+（Lower Confidence Bound）
+
+### 解决什么问题
+
+每个子节点的平均价值都是从有限次访问估出来的，访问少时估计噪声大。直接挑「平均价值最高」的着法，容易选中一个靠少数几次走运刷出来的虚高着法。LCB 用「均值 − k·标准误」排序，偏好被稳定验证过的好着法。
+
+### 做法
+
+KataGo 里 LCB 同时服务两件事，由 `useLcbForSelection` 控制：
+
+- **对弈 / 评估**：`getChosenMoveLoc` 用带 LCB 修正的权重选着法；
+- **自我对弈训练**：选落子时**临时关掉** LCB（用原始访问权重），选完再恢复，让 LCB 只作用在 **policy target** 上（`play.cpp` 的 HACK）。
+
+每个子节点的 LCB（`getSelfUtilityLCBAndRadius`）：设 $u$ 为平均 utility（win−loss），另外存 utility 平方均值来估方差：
+
+$$
+\text{ess} = \frac{(\sum w)^2}{\sum w^2}, \qquad
+\text{priorWeight} = \frac{\sum w}{\text{ess}^3}
+$$
+
+$$
+\overline{u^2} \leftarrow \frac{\overline{u^2}\,\sum w + (\overline{u^2} + R^2)\,\text{priorWeight}}{\sum w + \text{priorWeight}}
+$$
+
+$$
+\text{stderr} = \sqrt{\frac{\overline{u^2} - \bar u^2}{\text{ess}}}, \qquad
+\text{radius} = k\,\text{stderr}, \qquad
+\text{lcb} = u_{\text{父节点视角}} - \text{radius}
+$$
+
+其中 $R$ 是 utility 的最大半径（本仓库取 1）。
+
+生成 policy target 权重时（`getPlaySelectionValues`）：
+
+1. 先找最「稳定被探索」的子节点作 `nonLCBBest`；
+2. 在 $\text{weight} \ge \text{minVisitPropForLCB}\cdot\text{nonLCBBestWeight}$ 的子节点里取 `lcb` 最大者；
+3. 把它加权到足以压过其它人：
+
+$$
+\text{radiusFactor} = \frac{\text{radius}_i + \text{excess}}{\text{radius}_i + 0.20\,\text{excess}}, \qquad
+\text{excess} = \text{bestLcb} - \text{lcb}_i
+$$
+
+取 $\max(\text{weight}_{\text{best}},\ \max_i \text{radiusFactor}^2\cdot\text{weight}_i)$ 作为它的新权重。
+
+那个 $\text{minVisitPropForLCB}$ 门槛是为了防止「只访问一两次但 LCB 很高」的着法劫持 target。`useNonBuggyLcb` 修的是早年 $\text{bestLcbIndex} > 0$ 把下标 0 排除掉的 off-by-one。
+
+### 本仓库实现
+
+- `utils.py::lcb_play_selection(root, action_size, args)`：返回 LCB 修正并归一化后的分布。`weight = child.visits`（本仓库没有 forced playouts / retrospective pruning，跳过那一步）。
+- 节点新增 `utility_sq_sum`（精确平方和）用于算方差；串行 `Node.update` 与并行 `_backpropagate` 都更新。
+- 训练（`trainer.selfplay` / 并行 `_finish_move`）：**落子用原始访问分布**，**policy target（含 policy surprise）用 LCB 修正后的分布**。
+- 评估（`play.py`）：**落子用 LCB 修正后的分布**。
+- 配置默认对齐 KataGo selfplay：`use_lcb_for_selection = true`、`lcb_stdevs = 5.0`、`min_visit_prop_for_lcb = 0.15`、`use_non_buggy_lcb = true`。
+
+### 实验与结论
+
+本仓库暂无受控实验。
 
 ---
 
@@ -373,7 +438,7 @@ $$
 
 **围棋专用 / 其它**
 
-- 目数、归属、全局池化；LCB、graph search。
+- 目数、归属、全局池化；graph search。
 
 **评估**
 

@@ -4,7 +4,7 @@ import numpy as np
 
 from .mcts import MCTS
 from .network import ResNet
-from .utils import auto_device, find_latest_model, print_board
+from .utils import auto_device, find_latest_model, lcb_play_selection, print_board
 
 
 def play(game, train_args, side_names):
@@ -72,7 +72,9 @@ def play(game, train_args, side_names):
                     break
                 print("Illegal move.")
         else:
-            policy, root_value, _ = mcts.search(state, to_play, num_simulations, turn_number, False)
+            policy, root_value, root = mcts.search(state, to_play, num_simulations, turn_number, False)
+            if root is not None:
+                policy = lcb_play_selection(root, game.board_size ** 2, train_args)
             action = int(np.argmax(policy))
             row, col = divmod(action, game.board_size)
             print(f"AlphaZero plays: {row} {col}  root_value={root_value:+.3f}")

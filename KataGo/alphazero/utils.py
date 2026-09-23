@@ -1,4 +1,5 @@
 import glob
+import math
 import os
 
 import numpy as np
@@ -183,6 +184,91 @@ def finish_game_samples(memory, winner, game, args):
         }
         samples.extend(row.copy() for _ in range(count))
     return samples
+
+
+def lcb_play_selection(root, action_size, args):
+    weights = np.zeros(action_size)
+    for child in root.children:
+        weights[child.action_taken] = child.visits
+    if not args.get("use_lcb_for_selection", True):
+        total = weights.sum()
+        if total > 0:
+            weights /= total
+        return weights
+
+    children = root.children
+    num = len(children)
+    if num == 0:
+        return weights
+
+    utility_radius = 1.0
+    lcb_stdevs = args.get("lcb_stdevs", 5.0)
+    min_visit_prop = args.get("min_visit_prop_for_lcb", 0.15)
+    use_non_buggy = args.get("use_non_buggy_lcb", True)
+
+    zero_radius = 2.0 * utility_radius * lcb_stdevs
+    radius = [zero_radius] * num
+    lcb = [-zero_radius] * num
+    for i, child in enumerate(children):
+        visits = child.visits
+        if visits <= 0:
+            continue
+        avg = float((child.wdl_sum[0] - child.wdl_sum[2]) / visits)
+        sq = float(child.utility_sq_sum / visits)
+        weight_sum = float(visits)
+        weight_sq_sum = float(visits)
+        ess = weight_sum * weight_sum / weight_sq_sum
+        prior_weight = weight_sum / (ess * ess * ess)
+        sq = max(sq, avg * avg)
+        sq = (sq * weight_sum + (sq + utility_radius * utility_radius) * prior_weight) / (weight_sum + prior_weight)
+        weight_sum += prior_weight
+        weight_sq_sum += prior_weight * prior_weight
+        ess = weight_sum * weight_sum / weight_sq_sum
+        variance = max(0.0, sq - avg * avg)
+        radius[i] = lcb_stdevs * math.sqrt(variance / ess)
+        lcb[i] = -avg - radius[i]
+
+    best_goodness = -1e30
+    non_lcb_best_weight = -1e30
+    for child in children:
+        weight = float(child.visits)
+        goodness = (
+            weight * max(0.0, weight - 1.0) / max(1.0, weight)
+            + 2.0 * float(child.prior)
+        )
+        if goodness > best_goodness:
+            best_goodness = goodness
+            non_lcb_best_weight = weight
+
+    best_lcb = -1e10
+    best_lcb_idx = -1
+    for i, child in enumerate(children):
+        weight = float(child.visits)
+        if weight > 0 and weight >= min_visit_prop * non_lcb_best_weight:
+            if lcb[i] > best_lcb:
+                best_lcb = lcb[i]
+                best_lcb_idx = i
+
+    eligible = best_lcb_idx >= 0 if use_non_buggy else best_lcb_idx > 0
+    if eligible:
+        adjusted = float(children[best_lcb_idx].visits)
+        for i, child in enumerate(children):
+            if i == best_lcb_idx:
+                continue
+            excess = best_lcb - lcb[i]
+            if excess < 0:
+                continue
+            r = radius[i]
+            factor = (r + excess) / (r + 0.20 * excess)
+            lbound = factor * factor * float(child.visits)
+            if lbound > adjusted:
+                adjusted = lbound
+        weights[children[best_lcb_idx].action_taken] = adjusted
+
+    total = weights.sum()
+    if total > 0:
+        weights /= total
+    return weights
 
 
 def apply_temperature(probs, temperature):

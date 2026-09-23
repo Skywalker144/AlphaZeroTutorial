@@ -9,6 +9,7 @@ from .utils import (
     apply_temperature,
     chosen_move_temperature,
     finish_game_samples,
+    lcb_play_selection,
     policy_surprise,
     reduced_search_limit,
     root_policy_temperature,
@@ -40,6 +41,7 @@ class _Node:
         "action_taken",
         "children",
         "wdl_sum",
+        "utility_sq_sum",
         "visits",
         "legal_actions_mask",
         "prior_policy",
@@ -54,6 +56,7 @@ class _Node:
         self.action_taken = action_taken
         self.children = []
         self.wdl_sum = np.zeros(3)
+        self.utility_sq_sum = 0.0
         self.visits = 0
         self.legal_actions_mask = None
         self.prior_policy = None
@@ -128,6 +131,7 @@ def _backpropagate(node, wdl):
     """沿路径回传 value 并翻转视角（与 MCTS.backpropagate 一致）。"""
     while node is not None:
         node.wdl_sum += wdl
+        node.utility_sq_sum += (wdl[0] - wdl[2]) ** 2
         node.visits += 1
         wdl = wdl[::-1]
         node = node.parent
@@ -281,19 +285,20 @@ class _GameSession:
         search = self.search
         game = self.game
         root = search.root
-        mcts_policy = np.zeros(self.action_size)
+        raw_policy = np.zeros(self.action_size)
         for child in root.children:
-            mcts_policy[child.action_taken] = child.visits
-        mcts_policy /= np.sum(mcts_policy)
+            raw_policy[child.action_taken] = child.visits
+        raw_policy /= np.sum(raw_policy)
+        target_policy = lcb_play_selection(root, self.action_size, self.args)
         win_loss = (root.wdl_sum[0] - root.wdl_sum[2]) / root.visits
         self.win_loss_history.append(win_loss * self.to_play)
 
         self.memory.append({
             "state": self.state,
             "to_play": self.to_play,
-            "mcts_policy": mcts_policy,
+            "mcts_policy": target_policy,
             "weight": self.target_weight,
-            "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
+            "policy_surprise": policy_surprise(root.prior_policy, target_policy),
             "search_wdl": (root.wdl_sum / root.visits).copy(),
             "nn_wdl": root.nn_wdl.copy(),
         })
@@ -302,7 +307,7 @@ class _GameSession:
             self.args, self.turn_number, self.game.board_size
         )
         action = np.random.choice(
-            self.action_size, p=apply_temperature(mcts_policy, temperature)
+            self.action_size, p=apply_temperature(raw_policy, temperature)
         )
 
         self.state = game.get_next_state(self.state, action, self.to_play)

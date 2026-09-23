@@ -21,12 +21,14 @@ class Node:
         self.action_taken = action_taken
         self.children = []
         self.wdl_sum = np.zeros(3)
+        self.utility_sq_sum = 0.0
         self.visits = 0
         self.prior_policy = None
         self.nn_wdl = None
 
     def update(self, wdl):
         self.wdl_sum += wdl
+        self.utility_sq_sum += (wdl[0] - wdl[2]) ** 2
         self.visits += 1
 
     def q_value(self):
