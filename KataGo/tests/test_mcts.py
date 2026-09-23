@@ -157,6 +157,32 @@ class TestCheapSearch:
         mcts.search(state, 1, 5, 0, False)
         assert calls == {"temperature": 1, "noise": 1}
 
+    def test_evaluated_child_keeps_network_outputs_for_reuse(self):
+        game, mcts = make_mcts()
+        _, _, root = mcts.search(game.get_initial_state(), 1, 5, 0, False)
+        evaluated = [child for child in root.children if child.children]
+        assert evaluated
+        for child in evaluated:
+            assert child.prior_policy is not None
+            assert child.nn_wdl is not None
+
+
+class TestFpu:
+    def test_unvisited_value_blends_parent_and_network(self):
+        game, mcts = make_mcts()
+        mcts.args = {"c_puct": 0.0, "fpu_reduction_max": 0.2}
+        root = Node(game.get_initial_state(), 1)
+        root.visits = 10
+        root.wdl_sum = np.array([8.0, 0.0, 2.0])
+        root.nn_wdl = np.array([0.1, 0.0, 0.9])
+        visited = Node(None, -1, prior=0.2, parent=root)
+        visited.visits = 1
+        visited.wdl_sum = np.array([0.9, 0.0, 0.1])
+        unvisited = Node(None, -1, prior=0.8, parent=root)
+        root.children = [visited, unvisited]
+
+        assert mcts.select(root, False, False) is visited
+
 
 class TestValueTarget:
     def test_win_draw_loss_encoding(self):

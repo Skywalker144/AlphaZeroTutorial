@@ -6,6 +6,7 @@ import torch
 
 from alphazero import AlphaZero
 from alphazero.metrics import MetricsTracker
+from alphazero.utils import finish_game_samples, value_surprise
 from envs.tictactoe import TicTacToe
 
 
@@ -38,8 +39,7 @@ class TestSelfplay:
     def test_generates_terminal_game(self, tiny_args):
         az = AlphaZero(TicTacToe(), tiny_args)
         game_data, winner, game_len = az.selfplay()
-        assert len(game_data) > 0
-        assert game_len == len(game_data)
+        assert game_len > 0
         assert winner in (-1, 0, 1)
         for sample in game_data:
             assert sample["encoded_state"].shape == (3, 3, 3)
@@ -64,7 +64,13 @@ class TestSelfplay:
 
 class TestPlayoutCapRandomization:
     def test_all_full_records_every_move(self, tiny_args):
-        args = {**tiny_args, "cheap_search_prob": 0.0}
+        args = {
+            **tiny_args,
+            "cheap_search_prob": 0.0,
+            "reduce_visits": False,
+            "policy_surprise_data_weight": 0.0,
+            "value_surprise_data_weight": 0.0,
+        }
         az = AlphaZero(TicTacToe(), args)
         samples, winner, game_len = az.selfplay()
         assert len(samples) == game_len > 0
@@ -75,6 +81,121 @@ class TestPlayoutCapRandomization:
         samples, winner, game_len = az.selfplay()
         assert samples == []
         assert game_len > 0
+
+
+class TestSurpriseRows:
+    def test_cheap_position_can_gain_training_weight(self, monkeypatch):
+        game = TicTacToe()
+        initial = game.get_initial_state()
+        next_state = game.get_next_state(initial, 0, 1)
+        wdl = np.array([0.5, 0.0, 0.5])
+        memory = [
+            {
+                "state": initial,
+                "to_play": 1,
+                "mcts_policy": np.full(9, 1.0 / 9),
+                "weight": 1.0,
+                "policy_surprise": 1.0,
+                "search_wdl": wdl,
+                "nn_wdl": wdl,
+            },
+            {
+                "state": next_state,
+                "to_play": -1,
+                "mcts_policy": np.full(9, 1.0 / 9),
+                "weight": 0.0,
+                "policy_surprise": 3.0,
+                "search_wdl": wdl,
+                "nn_wdl": wdl,
+            },
+        ]
+        draws = iter([0.8, 0.2])
+        monkeypatch.setattr(np.random, "random", lambda: next(draws))
+
+        rows = finish_game_samples(
+            memory, 1, game,
+            {"policy_surprise_data_weight": 0.5, "value_surprise_data_weight": 0.0},
+        )
+
+        assert np.allclose([sample["weight"] for sample in memory], [0.7, 0.3])
+        assert len(rows) == 1
+        assert np.array_equal(rows[0]["encoded_state"], game.encode_state(next_state, -1))
+        assert "weight" not in rows[0]
+
+    def test_value_surprise_uses_forward_smoothed_outcome(self):
+        game = TicTacToe()
+        initial = game.get_initial_state()
+        next_state = game.get_next_state(initial, 0, 1)
+        first_search = np.array([0.6, 0.1, 0.3])
+        second_search = np.array([0.7, 0.1, 0.2])
+        first_nn = np.array([0.4, 0.1, 0.5])
+        second_nn = np.array([0.4, 0.1, 0.5])
+        memory = [
+            {
+                "state": initial,
+                "to_play": 1,
+                "mcts_policy": np.full(9, 1.0 / 9),
+                "weight": 1.0,
+                "policy_surprise": 0.0,
+                "search_wdl": first_search,
+                "nn_wdl": first_nn,
+            },
+            {
+                "state": next_state,
+                "to_play": -1,
+                "mcts_policy": np.full(9, 1.0 / 9),
+                "weight": 1.0,
+                "policy_surprise": 0.0,
+                "search_wdl": second_search,
+                "nn_wdl": second_nn,
+            },
+        ]
+
+        finish_game_samples(
+            memory, 1, game,
+            {"policy_surprise_data_weight": 0.0, "value_surprise_data_weight": 0.0},
+        )
+
+        factor = 1.0 / (1.0 + 9 * 0.016)
+        second_smoothed = np.array([1.0, 0.0, 0.0]) + factor * (
+            second_search[::-1] - np.array([1.0, 0.0, 0.0])
+        )
+        first_smoothed = second_smoothed + factor * (first_search - second_smoothed)
+        assert memory[1]["value_surprise"] == pytest.approx(
+            value_surprise(second_smoothed, second_nn[::-1])
+        )
+        assert memory[0]["value_surprise"] == pytest.approx(
+            value_surprise(first_smoothed, first_nn)
+        )
+
+    def test_weight_above_one_writes_duplicate_rows(self, monkeypatch):
+        game = TicTacToe()
+        state = game.get_initial_state()
+        wdl = np.array([0.5, 0.0, 0.5])
+        memory = [
+            {
+                "state": state,
+                "to_play": 1,
+                "mcts_policy": np.full(9, 1.0 / 9),
+                "weight": 1.0,
+                "policy_surprise": surprise,
+                "search_wdl": wdl,
+                "nn_wdl": wdl,
+            }
+            for surprise in (1.0, 3.0)
+        ]
+        draws = iter([0.9, 0.1])
+        monkeypatch.setattr(np.random, "random", lambda: next(draws))
+
+        rows = finish_game_samples(
+            memory, 1, game,
+            {"policy_surprise_data_weight": 1.0, "value_surprise_data_weight": 0.0},
+        )
+
+        assert np.allclose([sample["weight"] for sample in memory], [0.5, 1.5])
+        assert len(rows) == 2
+        assert rows[0] is not rows[1]
+        assert np.array_equal(rows[0]["encoded_state"], rows[1]["encoded_state"])
 
 
 class TestValueTargets:

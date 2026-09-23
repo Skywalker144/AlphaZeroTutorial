@@ -150,6 +150,41 @@ def redistribute_surprise_weights(samples, policy_data_weight, value_data_weight
         )
 
 
+def finish_game_samples(memory, winner, game, args):
+    future_wdl = value_target(winner, 1).astype(np.float64)
+    now_factor = 1.0 / (1.0 + game.board_size ** 2 * 0.016)
+    for sample in reversed(memory):
+        search_wdl = sample["search_wdl"]
+        nn_wdl = sample["nn_wdl"]
+        if sample["to_play"] == -1:
+            search_wdl = search_wdl[::-1]
+            nn_wdl = nn_wdl[::-1]
+        future_wdl = future_wdl + now_factor * (search_wdl - future_wdl)
+        sample["value_surprise"] = value_surprise(future_wdl, nn_wdl)
+
+    redistribute_surprise_weights(
+        memory,
+        args.get("policy_surprise_data_weight", 0.5),
+        args.get("value_surprise_data_weight", 0.1),
+    )
+
+    samples = []
+    for sample in memory:
+        weight = max(0.0, sample["weight"])
+        count = int(weight)
+        if np.random.random() < weight - count:
+            count += 1
+        if count == 0:
+            continue
+        row = {
+            "encoded_state": game.encode_state(sample["state"], sample["to_play"]),
+            "policy_target": sample["mcts_policy"],
+            "value_target": value_target(winner, sample["to_play"]),
+        }
+        samples.extend(row.copy() for _ in range(count))
+    return samples
+
+
 def apply_temperature(probs, temperature):
     if temperature <= 1e-4:
         result = np.zeros_like(probs)

@@ -65,7 +65,10 @@ class MCTS:
         for child in node.children:
             if child.visits > 0:
                 policy_mass_visited += child.prior
-        fpu_value = node.q_value() - reduction_max * math.sqrt(policy_mass_visited)
+        mix = min(1.0, policy_mass_visited ** 2)
+        nn_value = float(node.nn_wdl[0] - node.nn_wdl[2])
+        base_value = mix * node.q_value() + (1.0 - mix) * nn_value
+        fpu_value = base_value - reduction_max * math.sqrt(policy_mass_visited)
         best_score = -float("inf")
         best_child = None
         for child in node.children:
@@ -152,6 +155,8 @@ class MCTS:
                 value = value_target(self.game.get_winner(node.state, node.to_play), node.to_play)
             else:
                 policy, value = self.nn_inference(node.state, node.to_play)
+                node.prior_policy = policy
+                node.nn_wdl = value
                 self.expand(node, policy)
 
             self.backpropagate(node, value)

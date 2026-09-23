@@ -8,12 +8,11 @@ from .utils import (
     add_dirichlet_noise,
     apply_temperature,
     chosen_move_temperature,
+    finish_game_samples,
     policy_surprise,
-    redistribute_surprise_weights,
     reduced_search_limit,
     root_policy_temperature,
     search_visit_counts,
-    value_surprise,
     value_target,
 )
 
@@ -88,7 +87,10 @@ def _select(node, c_puct, reduction_max):
         parent_value = (node.wdl_sum[0] - node.wdl_sum[2]) / node.visits
     else:
         parent_value = 0.0
-    fpu_value = parent_value - reduction_max * math.sqrt(policy_mass_visited)
+    mix = min(1.0, policy_mass_visited ** 2)
+    nn_value = node.nn_wdl[0] - node.nn_wdl[2]
+    base_value = mix * parent_value + (1.0 - mix) * nn_value
+    fpu_value = base_value - reduction_max * math.sqrt(policy_mass_visited)
     sqrt_visits = math.sqrt(node.visits)
     best_score = -float("inf")
     best_child = None
@@ -255,7 +257,7 @@ class _GameSession:
             root = self.carried_root
             self.carried_root = None
             num_simulations = max(0, self.cheap_search_visits + 1 - root.visits)
-            self.target_weight = 1.0
+            self.target_weight = 0.0
         else:
             if self.carried_root is not None:
                 _discard_tree(self.carried_root)
@@ -263,7 +265,7 @@ class _GameSession:
             root = _Node(self.state, self.to_play)
             if self.is_cheap:
                 num_simulations = self.cheap_search_visits
-                self.target_weight = 1.0
+                self.target_weight = 0.0
             else:
                 num_simulations, self.target_weight = reduced_search_limit(
                     self.args, self.win_loss_history, self.num_simulations, self.cheap_search_visits
@@ -286,15 +288,15 @@ class _GameSession:
         win_loss = (root.wdl_sum[0] - root.wdl_sum[2]) / root.visits
         self.win_loss_history.append(win_loss * self.to_play)
 
-        if not self.is_cheap:
-            self.memory.append({
-                "state": self.state,
-                "to_play": self.to_play,
-                "mcts_policy": mcts_policy,
-                "weight": self.target_weight,
-                "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
-                "value_surprise": value_surprise(root.wdl_sum / root.visits, root.nn_wdl),
-            })
+        self.memory.append({
+            "state": self.state,
+            "to_play": self.to_play,
+            "mcts_policy": mcts_policy,
+            "weight": self.target_weight,
+            "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
+            "search_wdl": (root.wdl_sum / root.visits).copy(),
+            "nn_wdl": root.nn_wdl.copy(),
+        })
 
         temperature = chosen_move_temperature(
             self.args, self.turn_number, self.game.board_size
@@ -311,22 +313,7 @@ class _GameSession:
         if game.is_terminal(self.state, self.to_play):
             _discard_tree(search.root)
             winner = game.get_winner(self.state, self.to_play)
-            encode_state = game.encode_state
-            memory = self.memory
-            redistribute_surprise_weights(
-                memory,
-                self.args.get("policy_surprise_data_weight", 0.5),
-                self.args.get("value_surprise_data_weight", 0.1),
-            )
-            samples = [
-                {
-                    "encoded_state": encode_state(sample["state"], sample["to_play"]),
-                    "policy_target": sample["mcts_policy"],
-                    "value_target": value_target(winner, sample["to_play"]),
-                    "weight": sample["weight"],
-                }
-                for sample in memory
-            ]
+            samples = finish_game_samples(self.memory, winner, game, self.args)
             self.result = (samples, winner, self.turn_number)
         else:
             # 提升落子对应的子节点供下一步复用，其余断环立即释放。
@@ -409,9 +396,8 @@ class _GameSession:
                 board_size=self.game.board_size,
                 noise_weight=self.dirichlet_noise_weight,
             )
-        if node is search.root:
-            node.prior_policy = policy
-            node.nn_wdl = value
+        node.prior_policy = policy
+        node.nn_wdl = value
         _expand(node, policy, self.game, legal_actions_mask)
         _backpropagate(node, value)
         search.pending = None

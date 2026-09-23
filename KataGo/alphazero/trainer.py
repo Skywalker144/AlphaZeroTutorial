@@ -17,13 +17,11 @@ from .utils import (
     apply_temperature,
     auto_device,
     chosen_move_temperature,
+    finish_game_samples,
     policy_surprise,
     random_augment_batch,
-    redistribute_surprise_weights,
     reduced_search_limit,
     search_visit_counts,
-    value_surprise,
-    value_target,
 )
 
 
@@ -224,7 +222,7 @@ class AlphaZero:
             cheap = np.random.random() < cheap_search_prob
             if cheap:
                 num_simulations = cheap_simulations
-                weight = 1.0
+                weight = 0.0
             else:
                 num_simulations, weight = reduced_search_limit(
                     self.args, win_loss_history, full_simulations, cheap_simulations
@@ -238,15 +236,15 @@ class AlphaZero:
             )
             win_loss_history.append(root_value * to_play)
 
-            if not cheap:
-                memory.append({
-                    "state": state,
-                    "to_play": to_play,
-                    "mcts_policy": mcts_policy,
-                    "weight": weight,
-                    "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
-                    "value_surprise": value_surprise(root.wdl_sum / root.visits, root.nn_wdl),
-                })
+            memory.append({
+                "state": state,
+                "to_play": to_play,
+                "mcts_policy": mcts_policy,
+                "weight": weight,
+                "policy_surprise": policy_surprise(root.prior_policy, mcts_policy),
+                "search_wdl": (root.wdl_sum / root.visits).copy(),
+                "nn_wdl": root.nn_wdl.copy(),
+            })
 
             temperature = chosen_move_temperature(
                 self.args, turn_number, self.game.board_size
@@ -262,20 +260,7 @@ class AlphaZero:
             turn_number += 1
 
         winner = self.game.get_winner(state, to_play)
-        redistribute_surprise_weights(
-            memory,
-            self.args.get("policy_surprise_data_weight", 0.5),
-            self.args.get("value_surprise_data_weight", 0.1),
-        )
-        samples = [
-            {
-                "encoded_state": self.game.encode_state(sample["state"], sample["to_play"]),
-                "policy_target": sample["mcts_policy"],
-                "value_target": value_target(winner, sample["to_play"]),
-                "weight": sample["weight"],
-            }
-            for sample in memory
-        ]
+        samples = finish_game_samples(memory, winner, self.game, self.args)
         return samples, winner, turn_number
 
     def train_step(self):
@@ -293,19 +278,14 @@ class AlphaZero:
         value_targets = torch.tensor(
             np.array([s["value_target"] for s in batch]), dtype=torch.float32, device=self.device
         )
-        weights = torch.tensor(
-            np.array([s["weight"] for s in batch]), dtype=torch.float32, device=self.device
-        )
-
         self.model.train()
         self.optimizer.zero_grad()
         policy_logits, value_logits = self.model(states)
 
         policy_losses = -torch.sum(policy_targets * F.log_softmax(policy_logits, dim=1), dim=1)
         value_losses = -torch.sum(value_targets * F.log_softmax(value_logits, dim=1), dim=1)
-        weight_sum = weights.sum()
-        policy_loss = torch.sum(weights * policy_losses) / weight_sum
-        value_loss = torch.sum(weights * value_losses) / weight_sum
+        policy_loss = policy_losses.mean()
+        value_loss = value_losses.mean()
         total_loss = policy_loss + self.args.get("value_loss_scale", 1.2) * value_loss
 
         total_loss.backward()

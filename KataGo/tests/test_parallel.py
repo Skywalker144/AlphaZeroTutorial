@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from alphazero import AlphaZero, ParallelSelfPlayer, ResNet
+from alphazero.alphazero_parallel import _Node, _select
 from alphazero.mcts import MCTS, Node
 from envs.gomoku import Gomoku
 from envs.tictactoe import TicTacToe
@@ -31,7 +32,7 @@ def make_player(game=None, args=None):
 
 
 def assert_valid_game(samples, winner, game_len, game):
-    assert game_len == len(samples) > 0
+    assert game_len > 0
     assert winner in (-1, 0, 1)
     for sample in samples:
         assert sample["encoded_state"].shape == (game.num_planes, game.board_size, game.board_size)
@@ -68,6 +69,21 @@ class TestBatchedInference:
             seq_policy, seq_value = mcts.nn_inference(node.state, node.to_play)
             assert np.allclose(policy, seq_policy, atol=1e-5)
             assert np.allclose(value, seq_value, atol=1e-5)
+
+
+class TestFpu:
+    def test_unvisited_value_blends_parent_and_network(self):
+        root = _Node(None, 1)
+        root.visits = 10
+        root.wdl_sum = np.array([8.0, 0.0, 2.0])
+        root.nn_wdl = np.array([0.1, 0.0, 0.9])
+        visited = _Node(None, -1, prior=0.2, parent=root)
+        visited.visits = 1
+        visited.wdl_sum = np.array([0.9, 0.0, 0.1])
+        unvisited = _Node(None, -1, prior=0.8, parent=root)
+        root.children = [visited, unvisited]
+
+        assert _select(root, 0.0, 0.2) is visited
 
 
 class TestGames:
