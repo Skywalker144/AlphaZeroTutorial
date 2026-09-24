@@ -18,6 +18,8 @@
 - [ShapedDirichletNoise](#shapeddirichletnoise)
 - [SoftResign](#softresign)
 - [Policy(Value)SurpriseWeighting](#policyvaluesurpriseweighting)
+- [SoftPolicyTarget](#softpolicytarget)
+- [OpponentPolicyHead](#opponentpolicyhead)
 - [未实现 / 后续](#未实现--后续)
 
 ## 与 AlphaZero 的差异总览
@@ -33,6 +35,8 @@
 | ShapedDirichletNoise | alpha 一半均匀、一半按 `log(先验)` 形状 | 先验封顶按棋盘面积缩放 |
 | SoftResign | 一边倒时降低 full search 的访问数与样本权重，仍下到真实终局 | `reduced_visits_min` 取 cheap 访问数 |
 | Policy(Value)SurpriseWeighting | 按 policy/value 意外度重分配每局权重，按权重决定写入份数 | value surprise 用平滑前瞻版（KataGo 默认） |
+| SoftPolicyTarget | 增加一个 head 拟合 $p^{1/T}$ 的软化策略目标，逼网络学低概率着法之间的关系 | soft 目标不带 epsilon 底 |
+| OpponentPolicyHead | 增加 opponent / soft-opponent 两个 head，预测下一步（对手）的策略目标 | 一致 |
 
 下表之外的功能（并行自我对弈、批量推理、动态回放窗口、checkpoint、棋盘对称增强）两套实现都有，不属于本路线新增。
 
@@ -420,6 +424,58 @@ $$
 ### 实验与结论
 
 本仓库暂无受控实验。KataGo 官方认为 PolicySurprise 是较大的提升之一，而 ValueSurprise 更偏实验性、缺少严格验证。
+
+---
+
+## SoftPolicyTarget
+
+### 解决什么问题
+
+主 policy 目标通常高度集中在最好的 1~2 个着法上，交叉熵对低概率着法之间「谁排前面、差多少」几乎没有压力，网络缺少区分这些着法的动力。
+
+### 做法
+
+在主 policy 之外再加一个辅助 head，去拟合同一个策略目标的**软化版**：把目标做 $p^{1/T}$ 再归一化，$T = 4$（即 `pow(0.25)`）。
+
+```text
+主目标:    p          = [0.60, 0.36, 0.03, 0.01, ...]
+soft 目标: p^(1/4) 归一化 ≈ [0.37, 0.32, 0.18, 0.13, ...]
+```
+
+软化后低概率着法之间的差距被放大，网络必须真正学会「MCTS 更喜欢谁、多多少」，从而形成更好的内部特征，反过来也提升主 policy。
+
+### 本仓库实现
+
+- `network.py` 的 `policy_head` 输出 4 个平面，顺序与 KataGo 一致：`0 policy`、`1 opponent`、`2 soft policy`、`3 soft opponent`。
+- `utils.soft_policy_target(policy, temperature)` 只在 `policy > 0` 的支撑上做 $p^{1/T}$ 再归一化，非法位置保持 0。
+- `finish_game_samples` 为每行预算 `policy_target_soft` 与 `opponent_policy_soft`。
+- 损失：soft 目标用与主 policy 相同的交叉熵，权重为 `soft_policy_weight_scale = 8`（KataGo 默认），即 $L_\text{soft} = 8\cdot\text{CE}(p_\text{soft},\ \pi^{1/T})$。8 倍是补偿软化后平均梯度变小。
+
+### 实验与结论
+
+本仓库暂无受控实验。KataGo 报告该辅助目标显著加快策略学习。官方文档里的示例对应不带 epsilon 底的 $p^{1/T}$，本仓库采用这一版；KataGo 代码里另有 `+1e-7` 的底，小棋盘上会把 soft 目标压得过平。
+
+---
+
+## OpponentPolicyHead
+
+### 解决什么问题
+
+只看自己的 policy 不足以判断局面：同一个局面下对手会怎么应，直接影响这手棋的价值。让网络显式预测对手的策略，可以迫使它建模对手，也间接改善 value。
+
+### 做法
+
+在状态 $s_t$ 上，除了预测自己的策略目标 $\pi_t$，再额外预测**走完这步之后那个局面**的策略目标 $\pi_{t+1}$，也就是对手回应的策略。KataGo 训练数据里每行存两个 policy target，第二个正是下一 turn 的 policy target（`policyTarget1 = policyTargetsByTurn[turn+1]`），最后一手缺失时该行权重为 0。
+
+### 本仓库实现
+
+- 自对弈每步记录 `mcts_policy`；`finish_game_samples` 取第 $i$ 行的 `opponent_policy = memory[i+1]["mcts_policy"]`，最后一步没有下一步，`opponent_weight = 0`。
+- 损失权重：opponent head 的交叉熵乘 `opponent_policy_loss_scale = 0.15`；soft opponent 再乘 `soft_policy_weight_scale = 8`（即 $0.15\times 8 = 1.2$）。
+- 串行与并行自我对弈共用同一个 `finish_game_samples` 与 `random_augment_batch`，4 个 policy 平面用同一对称变换，因此两条路径天然一致。
+
+### 实验与结论
+
+本仓库暂无受控实验。
 
 ---
 

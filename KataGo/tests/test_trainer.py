@@ -6,7 +6,12 @@ import torch
 
 from alphazero import AlphaZero
 from alphazero.metrics import MetricsTracker
-from alphazero.utils import finish_game_samples, value_surprise
+from alphazero.utils import (
+    finish_game_samples,
+    random_augment_batch,
+    soft_policy_target,
+    value_surprise,
+)
 from envs.tictactoe import TicTacToe
 
 
@@ -217,7 +222,17 @@ class TestCheckpoint:
             az.replay_buffer.add_game(az.selfplay()[0])
             az.train_step()
         az.metrics.record_game(1, 1, 5, 0)
-        az.metrics.record_losses(1.0, 0.6, 0.4)
+        az.metrics.record_losses(
+            1.0,
+            0.6,
+            0.4,
+            {
+                "policy_player": 0.5,
+                "policy_opponent": 0.05,
+                "policy_soft": 0.4,
+                "policy_opponent_soft": 0.04,
+            },
+        )
         az.scheduler.record_iteration(games_played=2, rows_produced=12)
         az.scheduler.games_to_order(total_rows_produced=12)
 
@@ -395,3 +410,128 @@ class TestLearnLoop:
         resumed.learn()
         assert resumed.iteration == 2
         assert resumed.game_count == az.game_count
+
+
+class TestAuxiliaryPolicyTargets:
+    def _memory(self, game, policies):
+        state = game.get_initial_state()
+        memory = []
+        to_play = 1
+        for policy in policies:
+            memory.append(
+                {
+                    "state": state,
+                    "to_play": to_play,
+                    "mcts_policy": policy,
+                    "weight": 1.0,
+                    "policy_surprise": 0.0,
+                    "search_wdl": np.array([0.4, 0.2, 0.4]),
+                    "nn_wdl": np.array([0.4, 0.2, 0.4]),
+                }
+            )
+            to_play = -to_play
+        return memory
+
+    def test_soft_policy_target_sums_and_flattens(self):
+        policy = np.array([0.6, 0.3, 0.1, 0.0])
+        soft = soft_policy_target(policy, 4.0)
+        assert np.isclose(soft.sum(), 1.0)
+        assert soft[3] == 0.0
+        assert soft[0] < policy[0]
+        assert soft[0] / soft[2] < policy[0] / policy[2]
+
+    def test_soft_policy_target_uniform_is_unchanged(self):
+        policy = np.full(4, 0.25)
+        assert np.allclose(soft_policy_target(policy, 4.0), policy)
+
+    def test_opponent_target_is_next_step_policy(self):
+        game = TicTacToe()
+        policies = [np.eye(9)[i] for i in range(3)]
+        memory = self._memory(game, policies)
+        rows = finish_game_samples(
+            memory,
+            1,
+            game,
+            {
+                "policy_surprise_data_weight": 0.0,
+                "value_surprise_data_weight": 0.0,
+                "soft_policy_temperature": 4.0,
+            },
+        )
+        assert len(rows) == 3
+        for index in range(2):
+            assert np.array_equal(rows[index]["opponent_policy"], policies[index + 1])
+            assert rows[index]["opponent_weight"] == 1.0
+        assert rows[2]["opponent_weight"] == 0.0
+        assert np.array_equal(rows[2]["opponent_policy"], np.zeros(9))
+
+    def test_soft_targets_present_and_normalized(self):
+        game = TicTacToe()
+        policies = [np.eye(9)[0], np.full(9, 1.0 / 9)]
+        memory = self._memory(game, policies)
+        rows = finish_game_samples(
+            memory,
+            1,
+            game,
+            {"policy_surprise_data_weight": 0.0, "value_surprise_data_weight": 0.0},
+        )
+        for row in rows:
+            assert row["policy_target_soft"].shape == (9,)
+            assert row["opponent_policy_soft"].shape == (9,)
+            assert np.isclose(row["policy_target_soft"].sum(), 1.0)
+
+    def test_augment_keeps_four_planes_consistent(self):
+        batch = [
+            {
+                "encoded_state": np.zeros((3, 3, 3), dtype=np.int8),
+                "policy_target": np.eye(9)[0].astype(np.float32),
+                "opponent_policy": np.eye(9)[1].astype(np.float32),
+                "policy_target_soft": np.full(9, 1.0 / 9, dtype=np.float32),
+                "opponent_policy_soft": np.full(9, 1.0 / 9, dtype=np.float32),
+                "opponent_weight": 1.0,
+                "value_target": np.array([1.0, 0.0, 0.0]),
+            }
+        ]
+        np.random.seed(0)
+        augmented = random_augment_batch(batch, 3)[0]
+        for key in (
+            "policy_target",
+            "opponent_policy",
+            "policy_target_soft",
+            "opponent_policy_soft",
+        ):
+            assert augmented[key].shape == (9,)
+            assert np.isclose(augmented[key].sum(), 1.0)
+
+    def test_train_step_returns_loss_components(self, tiny_args):
+        args = {**tiny_args, "batch_size": 1, "min_rows": 1}
+        az = AlphaZero(TicTacToe(), args)
+        az.replay_buffer.add_game(az.selfplay()[0])
+        result = az.train_step()
+        for key in (
+            "total",
+            "policy",
+            "value",
+            "policy_player",
+            "policy_opponent",
+            "policy_soft",
+            "policy_opponent_soft",
+        ):
+            assert key in result
+        components = (
+            result["policy_player"]
+            + result["policy_opponent"]
+            + result["policy_soft"]
+            + result["policy_opponent_soft"]
+        )
+        assert np.isclose(result["policy"], components)
+
+
+class TestPolicyHeadOutputs:
+    def test_network_returns_four_policy_planes(self):
+        from alphazero.network import ResNet
+
+        model = ResNet(board_size=3, num_planes=3, num_blocks=1, num_channels=8)
+        policy_logits, value_logits = model(torch.zeros(2, 3, 3, 3))
+        assert policy_logits.shape == (2, 4, 9)
+        assert value_logits.shape == (2, 3)

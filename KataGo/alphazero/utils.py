@@ -151,6 +151,14 @@ def redistribute_surprise_weights(samples, policy_data_weight, value_data_weight
         )
 
 
+def soft_policy_target(policy, temperature):
+    soft = np.power(policy, 1.0 / temperature)
+    total = soft.sum()
+    if total > 0:
+        soft = soft / total
+    return soft
+
+
 def finish_game_samples(memory, winner, game, args):
     future_wdl = value_target(winner, 1).astype(np.float64)
     now_factor = 1.0 / (1.0 + game.board_size ** 2 * 0.016)
@@ -169,17 +177,30 @@ def finish_game_samples(memory, winner, game, args):
         args.get("value_surprise_data_weight", 0.1),
     )
 
+    temperature = args.get("soft_policy_temperature", 4.0)
+    action_size = game.board_size ** 2
     samples = []
-    for sample in memory:
+    for index, sample in enumerate(memory):
         weight = max(0.0, sample["weight"])
         count = int(weight)
         if np.random.random() < weight - count:
             count += 1
         if count == 0:
             continue
+        policy_target = sample["mcts_policy"]
+        if index + 1 < len(memory):
+            opponent_policy = memory[index + 1]["mcts_policy"]
+            opponent_weight = 1.0
+        else:
+            opponent_policy = np.zeros(action_size)
+            opponent_weight = 0.0
         row = {
             "encoded_state": game.encode_state(sample["state"], sample["to_play"]),
-            "policy_target": sample["mcts_policy"],
+            "policy_target": policy_target,
+            "opponent_policy": opponent_policy,
+            "policy_target_soft": soft_policy_target(policy_target, temperature),
+            "opponent_policy_soft": soft_policy_target(opponent_policy, temperature),
+            "opponent_weight": opponent_weight,
             "value_target": value_target(winner, sample["to_play"]),
         }
         samples.extend(row.copy() for _ in range(count))
@@ -323,24 +344,37 @@ def random_augment_batch(batch, board_size):
     对整个 batch 应用同一个随机对称变换 让网络学会对称性
     """
     states = np.stack([sample["encoded_state"] for sample in batch])
-    policies = np.stack(
-        [sample["policy_target"].reshape(board_size, board_size) for sample in batch]
+    policy_planes = np.stack(
+        [
+            np.stack(
+                [
+                    sample["policy_target"],
+                    sample["opponent_policy"],
+                    sample["policy_target_soft"],
+                    sample["opponent_policy_soft"],
+                ]
+            ).reshape(4, board_size, board_size)
+            for sample in batch
+        ]
     )
 
     k = np.random.randint(0, 4)
     flip = np.random.choice([True, False])
 
     states = np.rot90(states, k, axes=(2, 3))
-    policies = np.rot90(policies, k, axes=(1, 2))
+    policy_planes = np.rot90(policy_planes, k, axes=(2, 3))
     if flip:
         states = np.flip(states, axis=3)
-        policies = np.flip(policies, axis=2)
+        policy_planes = np.flip(policy_planes, axis=3)
 
     augmented_batch = []
-    for sample, state, policy in zip(batch, states, policies):
+    for sample, state, planes in zip(batch, states, policy_planes):
         new_sample = sample.copy()
         new_sample["encoded_state"] = np.ascontiguousarray(state)
-        new_sample["policy_target"] = policy.flatten()
+        new_sample["policy_target"] = planes[0].flatten()
+        new_sample["opponent_policy"] = planes[1].flatten()
+        new_sample["policy_target_soft"] = planes[2].flatten()
+        new_sample["opponent_policy_soft"] = planes[3].flatten()
         augmented_batch.append(new_sample)
     return augmented_batch
 

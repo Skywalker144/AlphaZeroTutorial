@@ -470,7 +470,7 @@ class ParallelSelfPlayer:
         policy_logits, value_logits = self.model(torch.from_numpy(encoded).to(self.device))
 
         # 一次性完成 mask + softmax，逐行结果与 utils.softmax 逐位一致。
-        logits = policy_logits.reshape(n, -1).float().cpu().numpy().astype(np.float64)
+        logits = policy_logits[:, 0, :].float().cpu().numpy().astype(np.float64)
         logits[~masks] = -np.inf
         logits -= logits.max(axis=1, keepdims=True)
         np.exp(logits, out=logits)

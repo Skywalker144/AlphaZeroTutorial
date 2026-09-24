@@ -17,6 +17,8 @@ class ResBlock(nn.Module):
 
 
 class ResNet(nn.Module):
+    num_policy_outputs = 4
+
     def __init__(self, board_size, num_planes, num_blocks=1, num_channels=32):
         super().__init__()
         self.board_size = board_size
@@ -34,7 +36,7 @@ class ResNet(nn.Module):
             nn.Conv2d(num_channels, num_channels, kernel_size=1, bias=False),
             nn.GroupNorm(1, num_channels),
             nn.SiLU(inplace=True),
-            nn.Conv2d(num_channels, 1, kernel_size=1, bias=True),
+            nn.Conv2d(num_channels, self.num_policy_outputs, kernel_size=1, bias=True),
         )
 
         self.value_head = nn.Sequential(
@@ -52,6 +54,6 @@ class ResNet(nn.Module):
         x = self.start_layer(x)
         for block in self.trunk:
             x = block(x)
-        policy_logits = self.policy_head(x).flatten(1)
+        policy_logits = self.policy_head(x).flatten(2)
         value_logits = self.value_head(x)
         return policy_logits, value_logits

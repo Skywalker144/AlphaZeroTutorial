@@ -36,12 +36,12 @@ python -m pytest tests/ -q
 | 模块 | 内容 |
 | --- | --- |
 | [井字棋环境](envs/tictactoe.py)、[五子棋环境](envs/gomoku.py) | 状态、合法动作、落子、胜负与网络输入编码 |
-| [network.py](alphazero/network.py) | ResNet 主干、策略 logits 和胜/平/负三分类 value head |
+| [network.py](alphazero/network.py) | ResNet 主干、4 个 policy 平面（policy / opponent / soft policy / soft opponent）和胜/平/负三分类 value head |
 | [mcts.py](alphazero/mcts.py) | 串行搜索：PUCT + FPU 选择、扩展、WDL 回传、树复用、根温度与 shaped 噪声 |
 | [alphazero_parallel.py](alphazero/alphazero_parallel.py) | 并行自我对弈与批量推理，算法与串行版保持一致 |
 | [replay_buffer.py](alphazero/replay_buffer.py) | 动态回放窗口、样本保留与随机采样 |
 | [trainer.py](alphazero/trainer.py) | 自我对弈、PlayoutCapRandomization、训练调度、损失与 checkpoint |
-| [utils.py](alphazero/utils.py) | 访问次数调度、温度、Dirichlet 噪声、LCB、SoftResign、Surprise 权重、棋盘对称增强与设备选择 |
+| [utils.py](alphazero/utils.py) | 访问次数调度、温度、Dirichlet 噪声、LCB、SoftResign、Surprise 权重、soft/opponent 策略目标、棋盘对称增强与设备选择 |
 | [tests/](tests/) | 游戏规则、搜索、训练、恢复与串行/并行等价性测试 |
 
 两个游戏均为交替行动的双人零和棋盘游戏。五子棋默认使用 9×9 棋盘，连续五子及以上获胜，不含禁手。环境接口和动作编码以对应实现为准。
@@ -63,6 +63,8 @@ python -m pytest tests/ -q
 - [ShapedDirichletNoise](../docs/KataGo.md#shapeddirichletnoise)
 - [SoftResign](../docs/KataGo.md#softresign)
 - [Policy(Value)SurpriseWeighting](../docs/KataGo.md#policyvaluesurpriseweighting)
+- [SoftPolicyTarget](../docs/KataGo.md#softpolicytarget)
+- [OpponentPolicyHead](../docs/KataGo.md#opponentpolicyhead)
 
 ## 当前行为与边界
 

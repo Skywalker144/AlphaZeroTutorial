@@ -277,6 +277,18 @@ class AlphaZero:
         policy_targets = torch.tensor(
             np.array([s["policy_target"] for s in batch]), dtype=torch.float32, device=self.device
         )
+        opponent_targets = torch.tensor(
+            np.array([s["opponent_policy"] for s in batch]), dtype=torch.float32, device=self.device
+        )
+        policy_targets_soft = torch.tensor(
+            np.array([s["policy_target_soft"] for s in batch]), dtype=torch.float32, device=self.device
+        )
+        opponent_targets_soft = torch.tensor(
+            np.array([s["opponent_policy_soft"] for s in batch]), dtype=torch.float32, device=self.device
+        )
+        opponent_weight = torch.tensor(
+            np.array([s["opponent_weight"] for s in batch]), dtype=torch.float32, device=self.device
+        )
         value_targets = torch.tensor(
             np.array([s["value_target"] for s in batch]), dtype=torch.float32, device=self.device
         )
@@ -284,16 +296,47 @@ class AlphaZero:
         self.optimizer.zero_grad()
         policy_logits, value_logits = self.model(states)
 
-        policy_losses = -torch.sum(policy_targets * F.log_softmax(policy_logits, dim=1), dim=1)
+        opponent_scale = self.args.get("opponent_policy_loss_scale", 0.15)
+        soft_scale = self.args.get("soft_policy_weight_scale", 8.0)
+
+        policy_player = self._policy_cross_entropy(policy_logits[:, 0], policy_targets)
+        policy_opponent = self._policy_cross_entropy(
+            policy_logits[:, 1], opponent_targets, opponent_weight
+        )
+        policy_soft = self._policy_cross_entropy(policy_logits[:, 2], policy_targets_soft)
+        policy_opponent_soft = self._policy_cross_entropy(
+            policy_logits[:, 3], opponent_targets_soft, opponent_weight
+        )
+
         value_losses = -torch.sum(value_targets * F.log_softmax(value_logits, dim=1), dim=1)
-        policy_loss = policy_losses.mean()
         value_loss = value_losses.mean()
+
+        weighted_player = policy_player
+        weighted_opponent = opponent_scale * policy_opponent
+        weighted_soft = soft_scale * policy_soft
+        weighted_opponent_soft = opponent_scale * soft_scale * policy_opponent_soft
+        policy_loss = weighted_player + weighted_opponent + weighted_soft + weighted_opponent_soft
         total_loss = policy_loss + self.args.get("value_loss_scale", 1.2) * value_loss
 
         total_loss.backward()
         self.optimizer.step()
         self.model.eval()
-        return total_loss.item(), policy_loss.item(), value_loss.item()
+        return {
+            "total": total_loss.item(),
+            "policy": policy_loss.item(),
+            "value": value_loss.item(),
+            "policy_player": weighted_player.item(),
+            "policy_opponent": weighted_opponent.item(),
+            "policy_soft": weighted_soft.item(),
+            "policy_opponent_soft": weighted_opponent_soft.item(),
+        }
+
+    @staticmethod
+    def _policy_cross_entropy(policy_logits, target, weight=None):
+        losses = -torch.sum(target * F.log_softmax(policy_logits, dim=1), dim=1)
+        if weight is not None:
+            losses = losses * weight
+        return losses.mean()
 
     # -- learn loop -------------------------------------------------------
 
@@ -364,28 +407,38 @@ class AlphaZero:
 
         train_steps = self.args.get("train_steps", 200)
         t0 = time.time()
-        total_loss = policy_loss = value_loss = 0.0
+        totals = {
+            "total": 0.0,
+            "policy": 0.0,
+            "value": 0.0,
+            "policy_player": 0.0,
+            "policy_opponent": 0.0,
+            "policy_soft": 0.0,
+            "policy_opponent_soft": 0.0,
+        }
         steps_done = 0
         try:
             for _ in self.reporter.train_progress(i, train_steps):
                 res = self.train_step()
                 if res:
-                    total_loss += res[0]
-                    policy_loss += res[1]
-                    value_loss += res[2]
+                    for key in totals:
+                        totals[key] += res[key]
                     steps_done += 1
-                    self.reporter.train_step_done(steps_done, total_loss)
+                    self.reporter.train_step_done(steps_done, totals["total"])
         finally:
             self.reporter.train_progress_finished()
 
         if steps_done:
-            losses = (
-                total_loss / steps_done,
-                policy_loss / steps_done,
-                value_loss / steps_done,
+            means = {key: value / steps_done for key, value in totals.items()}
+            self.metrics.record_losses(means["total"], means["policy"], means["value"], means)
+            self.reporter.train_done(
+                i,
+                steps_done,
+                time.time() - t0,
+                means["total"],
+                means["policy"],
+                means["value"],
             )
-            self.metrics.record_losses(*losses)
-            self.reporter.train_done(i, steps_done, time.time() - t0, *losses)
 
     # -- io ---------------------------------------------------------------
 

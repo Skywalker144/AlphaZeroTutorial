@@ -50,7 +50,7 @@ class MCTS:
         encoded = self.game.encode_state(state, to_play)
         tensor = torch.tensor(encoded, dtype=torch.float32, device=self.device).unsqueeze(0)
         policy_logits, value_logits = self.model(tensor)
-        policy_logits = policy_logits.flatten().cpu().numpy()
+        policy_logits = policy_logits[0, 0].cpu().numpy()
         value_probs = softmax(value_logits.flatten().float().cpu().numpy())
 
         policy_logits = self.game.mask_illegal_actions(state, to_play, policy_logits)

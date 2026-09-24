@@ -145,14 +145,19 @@ def _use_log_scale(axis, series):
 
 
 def write_metrics_csv(out_dir, losses, game_records):
+    component_keys = ("policy_player", "policy_opponent", "policy_soft", "policy_opponent_soft")
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "losses.csv"), "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["iteration", "total", "policy", "value"])
-        for index, (total, policy, value) in enumerate(
-            zip(losses["total"], losses["policy"], losses["value"])
-        ):
-            writer.writerow([index, total, policy, value])
+        writer.writerow(["iteration", "total", "policy", "value", *component_keys])
+        rows = zip(
+            losses["total"],
+            losses["policy"],
+            losses["value"],
+            *(losses[key] for key in component_keys),
+        )
+        for index, values in enumerate(rows):
+            writer.writerow([index, *values])
     with open(os.path.join(out_dir, "games.csv"), "w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
@@ -223,10 +228,18 @@ def render_training(out_dir, losses, game_records):
     _style_axis(axis)
 
     axis = axes[1, 1]
-    plotted = _plot_loss_series(axis, losses["policy"], BLUE, "Policy")
-    plotted |= _plot_loss_series(axis, losses["value"], GREEN, "Value")
+    component_series = (
+        ("Policy", BLUE, losses["policy_player"]),
+        ("Opponent", ORANGE, losses["policy_opponent"]),
+        ("Soft", RED, losses["policy_soft"]),
+        ("Soft opponent", GREY, losses["policy_opponent_soft"]),
+        ("Value", GREEN, losses["value"]),
+    )
+    plotted = False
+    for label, color, series in component_series:
+        plotted |= _plot_loss_series(axis, series, color, label)
     if plotted:
-        _use_log_scale(axis, [losses["policy"], losses["value"]])
+        _use_log_scale(axis, [series for _, _, series in component_series])
         axis.legend(fontsize=9)
     else:
         _empty_axis(axis, "No training iterations recorded yet")

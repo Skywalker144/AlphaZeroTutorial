@@ -5,16 +5,27 @@ from .plots import render_training, write_metrics_csv
 
 class MetricsTracker:
     def __init__(self):
-        self.losses = {"total": [], "policy": [], "value": []}
+        self.losses = {
+            "total": [],
+            "policy": [],
+            "value": [],
+            "policy_player": [],
+            "policy_opponent": [],
+            "policy_soft": [],
+            "policy_opponent_soft": [],
+        }
         self.game_records = []
 
     def record_game(self, game_index, winner, length, iteration):
         self.game_records.append((game_index, winner, length, iteration))
 
-    def record_losses(self, total, policy, value):
+    def record_losses(self, total, policy, value, components=None):
         self.losses["total"].append(total)
         self.losses["policy"].append(policy)
         self.losses["value"].append(value)
+        components = components or {}
+        for key in ("policy_player", "policy_opponent", "policy_soft", "policy_opponent_soft"):
+            self.losses[key].append(components.get(key, float("nan")))
 
     @staticmethod
     def winrate_summary(winners):
